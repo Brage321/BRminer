@@ -1,4 +1,3 @@
-
 # BRminer
 
 BRminer is a standalone Windows CPU miner that embeds the pinned ConnectCoin Core node and miner. It synchronizes and validates the chain, creates Core block templates with the configured payout, searches nonces using ConnectCoin's RandomX v2 proof of work, and submits solutions through Core's P2P node. It does not launch or require `connectcoind.exe` or `connectcoin-cli.exe`.
@@ -7,7 +6,7 @@ BRminer is a standalone Windows CPU miner that embeds the pinned ConnectCoin Cor
 
 Build `brminer.exe`, place it next to `mining-connectcoin.bat`, set `PAYOUT_ADDRESS` and `THREADS` in the batch file, then run it. The launcher explicitly selects ConnectCoin mainnet by default; an explicit network option such as `-regtest` overrides that default. Mainnet chain data is stored in Core's normal data directory unless you pass `-datadir=<path>`.
 
-The payout must be a valid **ConnectCoin type-1 P2PK address** accepted by the pinned Core miner. Make sure you control its private key; BRminer does not contain a wallet. Core RPC, daemon mode, Tor/onion routing/listening, and Core console logs are disabled by default; regular P2P networking remains enabled. Press Ctrl+C to stop. Detailed Core logs are in `debug.log` in the data directory.
+The payout must be a valid **ConnectCoin type-1 P2PK address** accepted by the pinned Core miner. Make sure you control its private key; BRminer does not contain a wallet. On mainnet, each block’s coinbase reward (subsidy plus included transaction fees) is split 98% to `PAYOUT_ADDRESS` and 2% to the developer address `cc1pkh240vqmu5zsvmtlk7f38704v46wa2cnuvvnnglq66nzzaa7zxcqsr59a6`; integer rounding is down to the smallest currency unit. The fee is paid only when BRminer finds and submits a valid block. On test networks, the second output goes to the miner payout address so test blocks do not pay the mainnet fee wallet. Note that the batch file’s sample payout currently equals the developer address, so change `PAYOUT_ADDRESS` to your own wallet if you want the split to pay two different destinations. Core RPC, daemon mode, Tor/onion routing/listening, and Core console logs are disabled by default; regular P2P networking remains enabled. Press Ctrl+C to stop. Detailed Core logs are in `debug.log` in the data directory.
 
 Every ten seconds, BRminer prints the CPU name, hashrate, accepted blocks, Core version, solo-share count, and miner state. Sync phase and header/block progress are shown only while the node is loading or syncing; those lines disappear once Core reports synchronization complete. On mainnet and public test networks, header percentage follows Core's time-based estimate using ConnectCoin's target block spacing. Block percentage is the active block height divided by the currently known header height. Neither percentage is a guaranteed remaining-time or full-chain estimate. Regtest displays header percentage as not applicable because its timestamps and block pace are artificial.
 
@@ -15,7 +14,7 @@ This is solo mining, not pool mining. The miner can only earn a reward if it fin
 
 ## ConnectCoin Core and verification
 
-CMake pins ConnectCoin Core commit `ff459a92dab40607cda4d92c6effdb85600ceea7` and links its node, consensus, P2P, block-template, and native CPU-mining implementations directly into BRminer. Core's standalone daemon, CLI, GUI, wallet, and RPC server targets are disabled. `--pow-self-test` remains a RandomX v2 known-answer test; it does not by itself demonstrate block mining.
+CMake pins ConnectCoin Core commit `ff459a92dab40607cda4d92c6effdb85600ceea7` and links its node, consensus, P2P, block-template, and native CPU-mining implementations directly into BRminer. A configure-time patch splits the native miner’s coinbase output without changing its total value. Core's standalone daemon, CLI, GUI, wallet, and RPC server targets are disabled. `--pow-self-test` remains a RandomX v2 known-answer test; it does not by itself demonstrate block mining.
 
 Local regtest runs have demonstrated Core's template, PoW validation, and block-submission path. Mainnet operation must still be verified by allowing the embedded node to connect and synchronize against live mainnet peers; no accepted mainnet block or reward has been demonstrated. The startup chain label helps distinguish mainnet from a test network.
 

@@ -1,0 +1,17 @@
+# Visual Studio and generated CMake build output
+.vs/
+build/
+build-msvc/
+out/
+
+# Local miner data and logs
+ConnectCoin/
+connectcoin.conf
+debug.log
+peers.dat
+anchors.dat
+blocks/
+chainstate/
+
+# Release executable is distributed as a GitHub Release asset
+brminer.exe

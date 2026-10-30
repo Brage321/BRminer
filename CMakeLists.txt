@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.22)
+﻿cmake_minimum_required(VERSION 3.22)
 project(BRminer VERSION 1.0.0 LANGUAGES C CXX)
 
 include(FetchContent)
@@ -8,6 +8,13 @@ FetchContent_Declare(
     connectcoin_source
     GIT_REPOSITORY https://github.com/connectcoincrypto/connectcoin.git
     GIT_TAG ff459a92dab40607cda4d92c6effdb85600ceea7
+    GIT_SHALLOW FALSE
+)
+
+FetchContent_Declare(
+    janusminer_source
+    GIT_REPOSITORY https://github.com/CoinFuMasterShifu/janusminer.git
+    GIT_TAG 8d13b2bad00bde6ae10195f30ba3bec8824fd1cb
     GIT_SHALLOW FALSE
 )
 
@@ -35,14 +42,35 @@ if(MSVC)
 endif()
 
 FetchContent_MakeAvailable(connectcoin_source)
-include(cmake/apply_connectcoin_dev_fee.cmake)
+FetchContent_MakeAvailable(janusminer_source)
+include(cmake/apply_janus_msvc_compat.cmake)
 target_include_directories(connectcoin_node PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+
+add_library(janus_verushash STATIC
+    "${janusminer_source_SOURCE_DIR}/src/shared/src/crypto/verushash/verushash.cpp"
+    "${janusminer_source_SOURCE_DIR}/src/shared/src/crypto/verushash/verus_clhash_port.cpp"
+)
+target_compile_features(janus_verushash PUBLIC cxx_std_20)
+target_include_directories(janus_verushash PUBLIC
+    "${janusminer_source_SOURCE_DIR}/src/shared/src"
+    "${janusminer_source_SOURCE_DIR}/src/shared/src/crypto/verushash"
+)
 
 add_executable(brminer
     src/main.cpp
+    src/connectcoin_pool.cpp
+    src/warthog_stratum.cpp
+    src/warthog_pow.cpp
     "${connectcoin_source_SOURCE_DIR}/src/init/bitcoind.cpp"
 )
 target_compile_features(brminer PRIVATE cxx_std_20)
+set_target_properties(brminer PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_RELWITHDEBINFO "${CMAKE_CURRENT_SOURCE_DIR}"
+    RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${CMAKE_CURRENT_SOURCE_DIR}"
+)
 target_include_directories(brminer PRIVATE
     "${connectcoin_source_SOURCE_DIR}/src"
     "${connectcoin_source_SOURCE_DIR}/src/randomx/src"
@@ -54,12 +82,27 @@ target_link_libraries(brminer PRIVATE
     connectcoin_node
     connectcoin_common
     connectcoin_util
+    connectcoin_crypto
+    univalue
+    janus_verushash
 )
+if(WIN32)
+    target_link_libraries(brminer PRIVATE ws2_32)
+endif()
 if(MINGW)
     target_link_options(brminer PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 
 if(BUILD_TESTING)
+    add_executable(warthog-pow-tests tests/warthog_pow_tests.cpp src/warthog_pow.cpp)
+    target_compile_features(warthog-pow-tests PRIVATE cxx_std_20)
+    target_include_directories(warthog-pow-tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${connectcoin_source_SOURCE_DIR}/src"
+    )
+    target_link_libraries(warthog-pow-tests PRIVATE connectcoin_crypto janus_verushash)
+    add_test(NAME warthog-pow-tests COMMAND warthog-pow-tests)
+
     add_executable(config-tests tests/config_tests.cpp)
     target_compile_features(config-tests PRIVATE cxx_std_17)
     add_test(NAME config-tests COMMAND config-tests)

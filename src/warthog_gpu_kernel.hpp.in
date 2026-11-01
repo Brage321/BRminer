@@ -1,0 +1,3 @@
+#pragma once
+
+inline constexpr char kWarthogOpenClKernel[] = R"BRMINER_OPENCL(@WARTHOG_OPENCL_KERNEL_SOURCE@)BRMINER_OPENCL";

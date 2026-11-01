@@ -46,6 +46,27 @@ FetchContent_MakeAvailable(janusminer_source)
 include(cmake/apply_janus_msvc_compat.cmake)
 target_include_directories(connectcoin_node PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
+file(READ "${janusminer_source_SOURCE_DIR}/src/miner/gpu/kernel.cl" WARTHOG_OPENCL_KERNEL_SOURCE)
+foreach(_gpu_kernel_patch IN ITEMS
+    [=[W3 = gid;]=]
+    [=[uint pos = 2 * atomic_inc(out) + 1;]=]
+    [=[if (pos < 2 * M) {]=]
+    [=[out[pos + 0] = gid;
+            out[pos + 1] = v0;]=]
+    [=[if (v0 >= c && v0 < threshold) {]=]
+)
+    string(FIND "${WARTHOG_OPENCL_KERNEL_SOURCE}" "${_gpu_kernel_patch}" _gpu_kernel_patch_index)
+    if(_gpu_kernel_patch_index EQUAL -1)
+        message(FATAL_ERROR "Pinned JanusMiner OpenCL kernel does not match the expected Warthog GPU patch context")
+    endif()
+endforeach()
+string(REPLACE "W3 = gid;" "W3 = SWAP32(gid);" WARTHOG_OPENCL_KERNEL_SOURCE "${WARTHOG_OPENCL_KERNEL_SOURCE}")
+string(REPLACE "uint pos = 2 * atomic_inc(out) + 1;" "uint pos = 9 * atomic_inc(out) + 1;" WARTHOG_OPENCL_KERNEL_SOURCE "${WARTHOG_OPENCL_KERNEL_SOURCE}")
+string(REPLACE "if (pos < 2 * M) {" "if (pos < 9 * M) {" WARTHOG_OPENCL_KERNEL_SOURCE "${WARTHOG_OPENCL_KERNEL_SOURCE}")
+string(REPLACE "out[pos + 0] = gid;\n            out[pos + 1] = v0;" "out[pos + 0] = gid;\n            out[pos + 1] = v0;\n            out[pos + 2] = v1;\n            out[pos + 3] = v2;\n            out[pos + 4] = v3;\n            out[pos + 5] = v4;\n            out[pos + 6] = v5;\n            out[pos + 7] = v6;\n            out[pos + 8] = v7;" WARTHOG_OPENCL_KERNEL_SOURCE "${WARTHOG_OPENCL_KERNEL_SOURCE}")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+configure_file(src/warthog_gpu_kernel.hpp.in "${CMAKE_CURRENT_BINARY_DIR}/generated/warthog_gpu_kernel.hpp" @ONLY)
+
 add_library(janus_verushash STATIC
     "${janusminer_source_SOURCE_DIR}/src/shared/src/crypto/verushash/verushash.cpp"
     "${janusminer_source_SOURCE_DIR}/src/shared/src/crypto/verushash/verus_clhash_port.cpp"
@@ -61,6 +82,7 @@ add_executable(brminer
     src/connectcoin_pool.cpp
     src/warthog_stratum.cpp
     src/warthog_pow.cpp
+    src/warthog_gpu.cpp
     "${connectcoin_source_SOURCE_DIR}/src/init/bitcoind.cpp"
 )
 target_compile_features(brminer PRIVATE cxx_std_20)
@@ -76,6 +98,8 @@ target_include_directories(brminer PRIVATE
     "${connectcoin_source_SOURCE_DIR}/src/randomx/src"
     "${connectcoin_source_BINARY_DIR}"
     "${connectcoin_source_BINARY_DIR}/src"
+    "${janusminer_source_SOURCE_DIR}/thirdparty/opencl/include"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 target_link_libraries(brminer PRIVATE
     core_interface
@@ -102,6 +126,23 @@ if(BUILD_TESTING)
     )
     target_link_libraries(warthog-pow-tests PRIVATE connectcoin_crypto janus_verushash)
     add_test(NAME warthog-pow-tests COMMAND warthog-pow-tests)
+
+    add_executable(warthog-gpu-tests
+        tests/warthog_gpu_tests.cpp
+        src/warthog_gpu.cpp
+        src/warthog_pow.cpp
+    )
+    target_compile_features(warthog-gpu-tests PRIVATE cxx_std_20)
+    target_include_directories(warthog-gpu-tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${connectcoin_source_SOURCE_DIR}/src"
+        "${janusminer_source_SOURCE_DIR}/thirdparty/opencl/include"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        "${janusminer_source_SOURCE_DIR}/src/shared/src"
+        "${janusminer_source_SOURCE_DIR}/src/shared/src/crypto/verushash"
+    )
+    target_link_libraries(warthog-gpu-tests PRIVATE connectcoin_crypto janus_verushash)
+    add_test(NAME warthog-gpu-tests COMMAND warthog-gpu-tests)
 
     add_executable(config-tests tests/config_tests.cpp)
     target_compile_features(config-tests PRIVATE cxx_std_17)

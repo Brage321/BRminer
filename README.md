@@ -80,7 +80,7 @@ for cache identity, retuning, promotion thresholds and repeatable comparisons.
 An interactive console keeps one table pinned above timestamped events for
 jobs, connection changes, submissions and acceptance/rejection. The table
 shows interval and average **combined Janus** rates, supporting GPU SHA256t and
-CPU Verus/SHA rates, share and block counters, difficulty and estimated share
+CPU Verus rates, share and block counters, difficulty and estimated share
 interval. The estimate is statistical, not a countdown. Resizing preserves
 recent events; redirected output uses plain text snapshots.
 

@@ -50,15 +50,19 @@ inline std::string formatMiningTable(const MiningStats& stats, const std::string
     const bool wide{columns >= 96};
     const int count{wide ? 5 : 3};
     const int width{wide ? 16 : std::max(16, (columns - 1) / 3 - 3)};
+    const int table_width{1 + count * (width + 3)};
     const auto border = [&] {
-        out << '+';
-        for (int i{}; i < count; ++i) out << std::string(width + 2, '-') << '+';
-        out << '\n';
+        out << '+' << std::string(table_width - 2, '-') << "+\n";
     };
     const auto row = [&](const std::initializer_list<std::string>& cells) {
+        const int cell_count{static_cast<int>(cells.size())};
+        const int content_width{table_width - 1 - 3 * cell_count};
+        int index{};
         out << '|';
-        for (const auto& cell : cells)
-            out << ' ' << std::left << std::setw(width) << cell.substr(0, width) << " |";
+        for (const auto& cell : cells) {
+            const int cell_width{content_width / cell_count + (index++ < content_width % cell_count)};
+            out << ' ' << std::left << std::setw(cell_width) << cell.substr(0, cell_width) << " |";
+        }
         out << '\n';
     };
     std::ostringstream difficulty, interval, rejected;
@@ -79,9 +83,9 @@ inline std::string formatMiningTable(const MiningStats& stats, const std::string
         << formatUptime(stats.uptime) << '\n';
     border();
     if (wide) {
-        row({"JANUS (10s)", "JANUS AVG", "GPU SHA256t", "CPU Verus", "CPU SHA256t"});
+        row({"JANUS (10s)", "JANUS AVG", "GPU SHA256t", "CPU Verus"});
         row({formatHashrate(stats.janus), formatHashrate(stats.janus_average),
-             formatHashrate(stats.gpu_sha), formatHashrate(stats.verus), formatHashrate(stats.cpu_sha)});
+             formatHashrate(stats.gpu_sha), formatHashrate(stats.verus)});
         border();
         row({"Accepted", "Rejected", "Blocks", "Share difficulty", "Est. share time"});
         row({std::to_string(stats.accepted), rejected.str(), std::to_string(stats.blocks),
@@ -90,8 +94,8 @@ inline std::string formatMiningTable(const MiningStats& stats, const std::string
         row({"JANUS (10s)", "JANUS AVG", "GPU SHA256t"});
         row({formatHashrate(stats.janus), formatHashrate(stats.janus_average), formatHashrate(stats.gpu_sha)});
         border();
-        row({"CPU Verus", "CPU SHA256t", "Share difficulty"});
-        row({formatHashrate(stats.verus), formatHashrate(stats.cpu_sha), difficulty.str()});
+        row({"CPU Verus", "Share difficulty"});
+        row({formatHashrate(stats.verus), difficulty.str()});
         border();
         row({width >= 19 ? "Accepted / Rejected" : "Accept / Reject", "Blocks", "Est. share time"});
         row({std::to_string(stats.accepted) + " / " + rejected.str(),

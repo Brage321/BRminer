@@ -15,3 +15,16 @@ chainstate/
 
 # Release executable is distributed as a GitHub Release asset
 brminer.exe
+
+# Local Linux executable, personal launchers and calibration output
+/brminer
+/mining-warthog-solo.bat
+/benchmark.json
+/profiles/
+__pycache__/
+
+# User-installed NVIDIA CUDA libraries and downloaded vendor notices
+/cuda/
+nvrtc*.dll
+libnvrtc*.so*
+/licenses/NVIDIA-CUDA-*.txt

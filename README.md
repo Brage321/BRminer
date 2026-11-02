@@ -1,51 +1,136 @@
 # BRminer
 
-BRminer is a standalone Windows miner. ConnectCoin pool mode uses the pinned ConnectCoin Core hashing and consensus code and connects directly to MeshPool over Stratum; it does not launch or require `connectcoind.exe` or `connectcoin-cli.exe`. Warthog mode can use CPU workers and detected OpenCL GPUs.
+BRminer is a Windows and Linux x86_64 miner for **Warthog (WART)** and
+ConnectCoin. Warthog combines CPU VerusHash with GPU SHA256t work. CPU hashing
+uses runtime feature checks for AMD and Intel processors; NVIDIA CUDA and
+OpenCL are optional GPU backends. BRminer takes no developer fee.
 
-## Run
+- [Build from source](docs/build.md): Windows, Linux and Docker/WSL2.
+- [Optional NVIDIA CUDA setup](docs/cuda-setup.md): install the Toolkit yourself.
+- [Benchmark and calibration](docs/benchmark-calibration.md).
+- [Verified results and hardware coverage](docs/development-goal.md).
 
-Build `brminer.exe`, place it next to `mining-connectcoin.bat`, replace the `PAYOUT_ADDRESS` placeholder in the batch file with your own address, then run it. The launcher connects to `stratum+tcp://pool.meshpool.net:3357` using plain TCP and authorizes the payout address as the worker identity. The payout must be a valid **ConnectCoin type-1 P2PK address**; make sure you control its private key because BRminer does not contain a wallet. No personal payout address is included in the release launcher. The miner does not start a local node, synchronize the chain, or use an explorer as a source of work.
+## Get started with Warthog
 
-BRminer does not take a developer fee. MeshPool's own solo-pool terms and any pool-side fees still apply. Press Ctrl+C to stop.
+Build from source or extract a release package. **CUDA libraries are not
+included.** For NVIDIA CUDA mining, install a compatible driver and the CUDA
+Toolkit using its default/Express installation. BRminer detects standard
+Toolkit installations automatically. See [CUDA setup](docs/cuda-setup.md) for
+supported tested versions, a ten-second check and nonstandard paths.
+Python and Visual Studio are not needed to run a release binary.
 
-Warthog console status is printed every ten seconds in aligned columns for CPU name, GPU name(s), combined SHA256t hashrate (H/s, kH/s, MH/s, GH/s, or TH/s), pool-assigned difficulty, estimated average share interval, accepted/rejected pool shares, and blocks found. The interval is an estimate, not a deadline. If no GPU is detected, the GPU field shows `CPU only`. The selected pool controls the accepted share target and any vardiff. Connection, GPU, and share errors are reported separately when they occur.
+On Windows, edit the pool and wallet in `mining-warthog.bat`, then run it.
+For example, a simple launcher using 14 CPU threads is:
 
-ConnectCoin pool mode currently uses MeshPool's observed 10-field `mining.notify` format and checks hashes with the pinned Core RandomX v2 implementation. A positive Stratum response only acknowledges a submission; verify that MeshPool records the share as valid in its dashboard.
-
-## Warthog
-
-Warthog mining defaults to BobFarm at `mine.bobfarm.icu:3033`. In `mining-warthog.bat`, edit `NODE` (under `THREADS`) to a compatible Warthog Stratum `hostname:port`; the payout address is used as the Stratum username. The selected pool controls the accepted target and any vardiff. BRminer displays the assigned difficulty and estimated average interval; this estimate is statistical, not a deadline.
-
-With a GPU detected, CPU threads are split between direct CPU mining and parallel verification of GPU candidates; GPU candidate filtering adapts to verifier queue pressure. When a job's 32-bit nonce range is exhausted, BRminer advances extranonce2 and rebuilds the same pool job so CPU and GPU workers keep searching without waiting for another pool notification. Without a detected GPU, all configured CPU threads mine directly.
-
-## ConnectCoin Core and verification
-
-CMake pins ConnectCoin Core commit `ff459a92dab40607cda4d92c6effdb85600ceea7`
-
-Local regtest runs have demonstrated Core's template, PoW validation, and block-submission path. Mainnet operation must still be verified by allowing the embedded node to connect and synchronize against live mainnet peers; no accepted mainnet block or reward has been demonstrated. The startup chain label helps distinguish mainnet from a test network.
-
-## Release status and packaging
-
-`brminer.exe` is a single Windows x64 executable; it has no ConnectCoin executable/CLI or VC++ runtime DLL dependency. Warthog GPU mode additionally needs a working vendor OpenCL driver. The release launcher files contain wallet placeholders only. The packaging script builds and tests Release, checks the embedded-Core marker and RandomX self-test, and creates a ZIP plus SHA-256 checksum under `out\release`:
-
-```powershell
-$env:VCPKG_ROOT = 'C:\vcpkg'
-.\scripts\package-release.ps1
+```bat
+@echo off
+cd /d "%~dp0"
+brminer.exe -a warthog -p us2.warthog.herominers.com:1143 -w YOUR-WARTHOG-WALLET --cpu_threads 14
+pause
 ```
 
-A successful build, local GPU-vs-CPU hash comparison, or authorized pool job does not prove pool acceptance. Live tests have confirmed valid ConnectCoin shares on MeshPool and an accepted Warthog share; these results do not guarantee future shares or block rewards. Do not describe the miner as having found a block unless the pool confirms it.
+On Linux, edit `mining-warthog.sh`, then run `./mining-warthog.sh`, or:
 
-## Build and test
-
-Use CMake 3.22 or newer, Visual Studio 2026's x64 C++ workload, and Boost 1.74+ headers with their CMake package available. If Boost is installed with vcpkg, set `VCPKG_ROOT` to the vcpkg installation before configuring:
-
-```powershell
-$env:VCPKG_ROOT = 'C:\vcpkg'
-cmake -S . -B build-msvc -G "Visual Studio 18 2026" -A x64 `
-  -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT\scripts\buildsystems\vcpkg.cmake" `
-  -DVCPKG_TARGET_TRIPLET=x64-windows
-cmake --build build-msvc --config Release --target brminer config-tests pow-tests warthog-pow-tests warthog-gpu-tests
-ctest --test-dir build-msvc -C Release --output-on-failure
+```sh
+./brminer -a warthog -p us2.warthog.herominers.com:1143 -w YOUR-WARTHOG-WALLET --cpu_threads 14
 ```
 
-CMake writes the single `brminer.exe` into the repository root, next to the launchers. Core's dependencies are built as static libraries so BRminer does not need a separate ConnectCoin executable or CLI at runtime.
+For solo mining, replace the endpoint with your Warthog Stratum node,
+for example `YOUR-NODE:3456`. Use a wallet you control. Endpoint formats accept
+`hostname:port` or `stratum+tcp://hostname:port`. Check the pool's own setup
+instructions and terms for your region. Press Ctrl+C to stop; Linux SIGTERM
+also shuts down cleanly.
+
+Omit `--cpu_threads` to use all logical CPU threads. `--backend cuda`,
+`--backend opencl` and `--backend cpu` explicitly select a backend. Automatic
+mode tries CUDA, OpenCL, then CPU. Confirm the backend printed at startup.
+A missing CUDA installation can therefore still allow mining with a fallback.
+
+## Benchmark and tune
+
+No wallet or server is needed for an offline benchmark:
+
+```bat
+brminer.exe --benchmark --backend cuda --duration 300 --warmup 30 --json benchmark.json
+brminer.exe --calibrate
+brminer.exe --calibrate --full
+brminer.exe --calibration-status
+```
+
+Use `./brminer` on Linux. The benchmark launcher runs five measured minutes
+after warmup. Use `--backend cpu` when CUDA is not installed.
+
+Quick calibration screens CPU worker count, CUDA launch sizes and combined
+Janus performance. It took about 69 seconds on the tested one-GPU host; duration
+varies with hardware. The quick plan is provisional. Add `--autotune` to a
+mining command to use it immediately, or use `--calibrate --full` for repeated
+five-minute validation and a saved profile. Normal CUDA mining reloads a
+matching validated profile without benchmarking. Manual overrides remain fixed.
+
+Default CUDA settings are 67,108,864 nonces per batch and 256 threads per block.
+Override them with `--cuda-batch-size` and `--cuda-block-size`.
+Environment equivalents include `BRMINER_THREADS`,
+`BRMINER_CUDA_BATCH_SIZE`, `BRMINER_CUDA_BLOCK_SIZE`, and
+`BRMINER_NVRTC_LIBRARY` (`BRMINER_NVRTC_DLL` also works).
+CLI settings take precedence. See [all calibration controls](docs/benchmark-calibration.md)
+for cache identity, retuning, promotion thresholds and repeatable comparisons.
+
+## Mining display
+
+An interactive console keeps one table pinned above timestamped events for
+jobs, connection changes, submissions and acceptance/rejection. The table
+shows interval and average **combined Janus** rates, supporting GPU SHA256t and
+CPU Verus/SHA rates, share and block counters, difficulty and estimated share
+interval. The estimate is statistical, not a countdown. Resizing preserves
+recent events; redirected output uses plain text snapshots.
+
+Optional NVIDIA monitoring shows temperature, utilization, power, clocks and
+clock-limit reasons where supported. Unavailable values show `N/A` and JSON
+`null`. Missing NVML does not prevent mining; `BRMINER_DISABLE_NVML=1`
+disables monitoring. `BRMINER_BENCHMARK_TELEMETRY=1` adds machine-readable
+`BRMINER_METRICS` lines during mining.
+
+## Build, test and package
+
+Follow [the complete build guide](docs/build.md). CMake fetches pinned
+ConnectCoin Core and JanusMiner sources and writes the executable into the
+checkout root. The CUDA Toolkit is optional at build time: NVRTC compiles the
+embedded GPU source at runtime when CUDA is used.
+
+Windows packaging builds and tests Release, checks the embedded-Core marker
+and RandomX known answer, then writes a ZIP and SHA-256 sidecar:
+
+```powershell
+.\scripts\package-release.ps1 -BuildDirectory out/build/windows -Generator Ninja
+```
+
+The Linux packaging command is in [the build guide](docs/build.md).
+Both packages contain launchers, instructions and required source dependency
+notices. Neither packages nor Git include NVIDIA CUDA binaries, personal wallets,
+solo-node settings, calibration profiles, logs or build products.
+The CUDA kernel source and its attribution remain part of BRminer.
+
+## ConnectCoin pool mode
+
+Edit `mining-connectcoin.bat` with your ConnectCoin type-1 P2PK payout address.
+It connects to `stratum+tcp://pool.meshpool.net:3357` using plain TCP and the
+pool's observed ten-field notify format. Pool-side terms and fees apply.
+Core hashing and consensus code are embedded; no separate
+`connectcoind.exe` or `connectcoin-cli.exe` is needed for pool mining.
+BRminer does not contain a wallet.
+
+## Validation and source map
+
+The tested host is a Ryzen 7 5800X / RTX 4060. Windows passed 16 tests and native
+Ubuntu 24.04 under Docker/WSL2 passed 19, including CUDA correctness and older
+AMD/Intel feature emulation. Final five-minute HeroMiners sessions accepted
+10 Windows and 14 Linux shares with zero rejects. Controlled benchmarks,
+profile invalidation, node reconnection and clean shutdown were also verified.
+
+These results do not establish performance on physical Intel systems,
+bare-metal Linux, other NVIDIA architectures or multi-GPU systems.
+Accepted shares do not establish a confirmed block reward.
+See [the acceptance report](docs/development-goal.md),
+[Linux runtime requirements](docs/warthog-portability.md),
+[the architecture map](docs/knowledge-graph.md), and
+[historical performance work](docs/warthog-optimization-progress.md).

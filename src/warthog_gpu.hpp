@@ -10,10 +10,7 @@
 
 namespace brminer::warthog {
 
-struct Sha256tCandidate {
-	std::uint32_t nonce{};
-	std::array<std::uint8_t, 32> hash{};
-};
+std::array<std::uint32_t, 8> warthogSha256Midstate(const Header& header);
 
 class OpenClSha256tMiner {
 public:

@@ -1,3 +1,6 @@
 #pragma once
 
-inline constexpr char kWarthogOpenClKernel[] = R"BRMINER_OPENCL(@WARTHOG_OPENCL_KERNEL_SOURCE@)BRMINER_OPENCL";
+#include <string_view>
+
+inline constexpr std::string_view kWarthogOpenClKernelChunks[] = {
+@WARTHOG_OPENCL_KERNEL_CHUNKS@};

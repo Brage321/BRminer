@@ -1,8 +1,11 @@
 #include "config.hpp"
+#include "miner_options.hpp"
 #include "connectcoin_pool.hpp"
 #include "pow.hpp"
 #include "randomx_hasher.hpp"
 #include "warthog_miner.hpp"
+#include "warthog_benchmark.hpp"
+#include "calibration.hpp"
 
 #include <common/args.h>
 #include <common/init.h>
@@ -34,6 +37,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -290,6 +294,11 @@ int runNode(int argc, char* argv[], const std::string& payout_address,
 
 int main(int argc, char* argv[]) {
     try {
+        if (argc > 1 && std::string{argv[1]} == "--benchmark")
+            return brminer::warthog::runBenchmarkCommand(argc, argv);
+        if (argc > 1 && (std::string{argv[1]} == "--calibrate" || std::string{argv[1]} == "--retune" ||
+                std::string{argv[1]} == "--calibration-status"))
+            return brminer::warthog::runCalibrationCommand(argc, argv);
         if (argc == 2 && std::string(argv[1]) == "--embedded-core-check") {
             std::cout << "BRMINER_EMBEDDED_CORE=7" << std::endl;
             return EXIT_SUCCESS;
@@ -297,11 +306,34 @@ int main(int argc, char* argv[]) {
         if (argc == 2 && std::string(argv[1]) == "--pow-self-test") {
             return runPowSelfTest();
         }
+        if (argc == 2 && std::string(argv[1]) == "--help") {
+            std::cout << "BRminer Warthog mining\n"
+                "Usage: brminer.exe -a warthog -p HOST:PORT -w WALLET --cpu_threads N\n"
+                "  -p, --pool          Stratum endpoint (stratum+tcp:// is optional)\n"
+                "  -w, --wallet        Warthog payout address\n"
+                "  -t, --cpu_threads   CPU threads (default: all logical threads)\n"
+                "CUDA is detected automatically from bundled NVRTC libraries.\n"
+                "Press Ctrl+C to stop.\n";
+            std::cout << "Offline benchmark: brminer --benchmark --duration 300 --warmup 30 --json benchmark.json\n"
+                "  --backend auto|cuda|opencl|cpu  --threads N\n"
+                "  --cuda-batch-size N  --cuda-block-size N  --nvrtc-library PATH  --quiet\n";
+            std::cout << "Quick calibration: brminer --calibrate [--profile-dir DIRECTORY] [--threads N]\n"
+                "  Add --full for repeated five-minute validation and a saved hardware profile.\n"
+                "  --calibration-status checks cached settings; --retune recalibrates.\n"
+                "Mining automatically loads matching profiles. Add --autotune to tune if missing.\n"
+                "Manual thread, batch, and block settings remain fixed during calibration.\n";
+            return EXIT_SUCCESS;
+        }
 
         const std::string payout_address = environment("BRMINER_PAYOUT_ADDRESS");
         const std::string thread_setting = environment("BRMINER_THREADS");
         const std::string node_setting = environment("BRMINER_WART_NODE");
         const std::string coin = environment("BRMINER_COIN");
+        const std::vector<std::string_view> args{argv + 1, argv + argc};
+        if (const auto options = brminer::parseWarthogOptions(args,
+                {payout_address, thread_setting, node_setting})) {
+            return brminer::warthog::runMiner(options->wallet, options->threads, options->pool, options->tuning);
+        }
         if (coin == "WART") {
             return brminer::warthog::runMiner(payout_address, thread_setting, node_setting);
         }
@@ -309,6 +341,9 @@ int main(int argc, char* argv[]) {
             return brminer::connectcoin_pool::runMiner(payout_address, thread_setting);
         }
         return runNode(argc, argv, payout_address, thread_setting);
+    } catch (const brminer::warthog::CalibrationCancelled& error) {
+        std::cerr << error.what() << std::endl;
+        return 130;
     } catch (const std::exception& error) {
         std::cerr << "BRminer: " << error.what() << std::endl;
         return EXIT_FAILURE;

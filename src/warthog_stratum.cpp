@@ -1,8 +1,13 @@
 ﻿#include "warthog_miner.hpp"
 
 #include "config.hpp"
+#include "platform.hpp"
+#include "warthog_cuda.hpp"
+#include "warthog_console.hpp"
 #include "warthog_gpu.hpp"
 #include "warthog_pow.hpp"
+#include "warthog_benchmark.hpp"
+#include "calibration.hpp"
 
 #include <crypto/sha256.h>
 #include <univalue.h>
@@ -11,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <climits>
+#include <charconv>
 #include <condition_variable>
 #include <chrono>
 #include <cmath>
@@ -21,9 +27,11 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -40,6 +48,19 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#else
+#include <cerrno>
+#include <netdb.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
+using SOCKET = int;
+constexpr int INVALID_SOCKET{-1};
+constexpr int SOCKET_ERROR{-1};
+constexpr int WSAETIMEDOUT{ETIMEDOUT};
+constexpr int WSAEWOULDBLOCK{EAGAIN};
+inline int WSAGetLastError() { return errno; }
+inline int closesocket(int socket) { return ::close(socket); }
 #endif
 
 namespace brminer::warthog {
@@ -50,7 +71,8 @@ constexpr std::uint32_t kAuthorizeId = 2;
 constexpr std::uint32_t kSha256tCandidateFloor{0x0147ae14U};
 constexpr double kInitialGpuCandidateFraction{0.00005};
 constexpr double kTargetShareIntervalSeconds{60.0};
-constexpr std::size_t kGpuCandidateQueueLimit{65536};
+constexpr std::size_t kGpuCandidateQueueLimit{4194304};
+constexpr std::size_t kGpuCandidateTakeBatch{1024};
 constexpr auto kGpuThresholdAdjustmentInterval{std::chrono::milliseconds{500}};
 
 std::uint32_t candidateThreshold(double fraction) {
@@ -145,22 +167,28 @@ struct MinedShare {
 	bool block_candidate{};
 };
 
-struct GpuCandidate {
+struct GpuCandidateBatch {
 	std::shared_ptr<const MiningJob> job;
-	Sha256tCandidate candidate;
+	std::vector<Sha256tCandidate> candidates;
+	std::size_t next{};
 };
 
 struct MinerState {
 	std::mutex mutex;
 	std::condition_variable changed;
 	std::shared_ptr<const MiningJob> job;
-	std::deque<GpuCandidate> gpu_candidates;
+	std::deque<GpuCandidateBatch> gpu_candidates;
+	std::size_t gpu_candidate_count{};
 	std::atomic<std::uint32_t> gpu_candidate_threshold{candidateThreshold(kInitialGpuCandidateFraction)};
+	std::atomic<double> gpu_candidate_floor{kInitialGpuCandidateFraction};
 	std::uint64_t next_job_id{};
 	std::atomic<std::uint64_t> next_nonce{0};
 	std::atomic<std::uint64_t> cpu_sha256t_hashes{0};
 	std::atomic<std::uint64_t> gpu_sha256t_hashes{0};
 	std::atomic<std::uint64_t> verushash_hashes{0};
+	std::atomic<std::uint64_t> gpu_candidates_found{0};
+	std::atomic<std::uint64_t> gpu_scan_nanos{0};
+	std::atomic<std::uint64_t> gpu_queue_wait_nanos{0};
 	std::atomic<std::uint32_t> gpu_workers_ready{0};
 	std::string gpu_error;
 	std::atomic<std::uint64_t> accepted_shares{0};
@@ -172,10 +200,14 @@ struct MinerState {
 	std::atomic<bool> connected{false};
 	std::atomic<bool> solution_ready{false};
 	std::optional<MinedShare> solution;
+	MiningConsole console;
+	bool benchmark{};
+	std::atomic<bool> worker_failed{false};
 };
 
 void recordSolution(MinerState& state, const std::shared_ptr<const MiningJob>& job,
 					std::uint32_t nonce, const PowResult& result) {
+	if (state.benchmark) return;
 	if (!result.meets_target && !result.meets_share_target) return;
 	MinedShare share;
 	share.pool_job_id = job->pool_job_id;
@@ -189,33 +221,64 @@ void recordSolution(MinerState& state, const std::shared_ptr<const MiningJob>& j
 		state.solution = std::move(share);
 		state.solution_ready.store(true, std::memory_order_relaxed);
 		state.changed.notify_all();
+		state.console.event(result.meets_target ? "BLOCK FOUND: queued for submission." : "Share found: queued for submission.");
 	}
 }
 
-std::optional<GpuCandidate> takeGpuCandidate(MinerState& state) {
+bool takeGpuCandidates(MinerState& state, std::shared_ptr<const MiningJob>& job,
+					   std::vector<Sha256tCandidate>& batch) {
 	std::lock_guard lock{state.mutex};
+	const bool queue_was_limited{state.gpu_candidate_count > kGpuCandidateQueueLimit};
+	batch.clear();
 	while (!state.gpu_candidates.empty() &&
 		   (!state.job || state.gpu_candidates.front().job->id != state.job->id)) {
+		const auto& stale{state.gpu_candidates.front()};
+		state.gpu_candidate_count -= stale.candidates.size() - stale.next;
 		state.gpu_candidates.pop_front();
 	}
-	if (state.gpu_candidates.empty()) return std::nullopt;
-	auto candidate{std::move(state.gpu_candidates.front())};
-	state.gpu_candidates.pop_front();
-	state.changed.notify_all();
-	return candidate;
+	if (!state.gpu_candidates.empty()) {
+		auto& front{state.gpu_candidates.front()};
+		job = front.job;
+		const auto count{std::min(kGpuCandidateTakeBatch, front.candidates.size() - front.next)};
+		batch.insert(batch.end(),
+			std::make_move_iterator(front.candidates.begin() + front.next),
+			std::make_move_iterator(front.candidates.begin() + front.next + count));
+		front.next += count;
+		state.gpu_candidate_count -= count;
+		if (front.next == front.candidates.size()) state.gpu_candidates.pop_front();
+	}
+	if (queue_was_limited && state.gpu_candidate_count <= kGpuCandidateQueueLimit) {
+		state.changed.notify_all();
+	}
+	return !batch.empty();
 }
 
-void verifyGpuCandidate(MinerState& state, GpuCandidate&& mined) {
-	Header candidate_header{mined.job->header};
-	candidate_header[76] = static_cast<std::uint8_t>(mined.candidate.nonce);
-	candidate_header[77] = static_cast<std::uint8_t>(mined.candidate.nonce >> 8);
-	candidate_header[78] = static_cast<std::uint8_t>(mined.candidate.nonce >> 16);
-	candidate_header[79] = static_cast<std::uint8_t>(mined.candidate.nonce >> 24);
-	const PowResult result{checkJanusHash(candidate_header, mined.candidate.hash,
-									 mined.job->share_difficulty)};
-	if (!result.sha256t_candidate) return;
-	state.verushash_hashes.fetch_add(1, std::memory_order_relaxed);
-	recordSolution(state, mined.job, mined.candidate.nonce, result);
+Header gpuCandidateHeader(const MiningJob& job, const Sha256tCandidate& candidate) {
+    Header candidate_header{job.header};
+	candidate_header[76] = static_cast<std::uint8_t>(candidate.nonce);
+	candidate_header[77] = static_cast<std::uint8_t>(candidate.nonce >> 8);
+	candidate_header[78] = static_cast<std::uint8_t>(candidate.nonce >> 16);
+	candidate_header[79] = static_cast<std::uint8_t>(candidate.nonce >> 24);
+	return candidate_header;
+}
+
+bool confirmGpuCandidate(MinerState& state, const std::shared_ptr<const MiningJob>& job,
+		const Sha256tCandidate& candidate, const Header& candidate_header,
+		const PowResult& result) {
+	if (!result.sha256t_candidate) return false;
+	if (!result.meets_target && !result.meets_share_target) return true;
+	const auto full_sha_hash{sha256t(candidate_header)};
+	const std::uint32_t confirmed_word{(static_cast<std::uint32_t>(full_sha_hash[0]) << 24) |
+		(static_cast<std::uint32_t>(full_sha_hash[1]) << 16) |
+		(static_cast<std::uint32_t>(full_sha_hash[2]) << 8) | full_sha_hash[3]};
+	if (confirmed_word != candidate.sha_word) {
+		state.console.event("ERROR: GPU SHA256t candidate failed CPU confirmation.");
+		return true;
+	}
+	const PowResult confirmed{checkJanusHash(candidate_header, full_sha_hash,
+									 job->share_difficulty)};
+	recordSolution(state, job, candidate.nonce, confirmed);
+	return true;
 }
 
 std::vector<std::uint8_t> makeExtraNonce2(std::uint64_t counter, std::uint32_t size) {
@@ -252,16 +315,22 @@ MiningJob buildJob(const Notify& notify, const std::vector<std::uint8_t>& extra_
 	return job;
 }
 
-#if defined(_WIN32)
-
 class WinsockRuntime {
 public:
 	WinsockRuntime() {
+#if defined(_WIN32)
 		WSADATA data{};
 		const int result{WSAStartup(MAKEWORD(2, 2), &data)};
 		if (result != 0) throw std::runtime_error("Could not initialize Windows networking: " + std::to_string(result));
+#else
+		std::signal(SIGPIPE, SIG_IGN);
+#endif
 	}
-	~WinsockRuntime() { WSACleanup(); }
+	~WinsockRuntime() {
+#if defined(_WIN32)
+		WSACleanup();
+#endif
+	}
 	WinsockRuntime(const WinsockRuntime&) = delete;
 	WinsockRuntime& operator=(const WinsockRuntime&) = delete;
 };
@@ -302,7 +371,11 @@ SocketHandle connectPool(const brminer::PoolEndpoint& endpoint) {
 			last_error = WSAGetLastError();
 			continue;
 		}
+#if defined(_WIN32)
 		DWORD timeout{250};
+#else
+		timeval timeout{0, 250000};
+#endif
 		setsockopt(socket.get(), SOL_SOCKET, SO_RCVTIMEO,
 				   reinterpret_cast<const char*>(&timeout), sizeof(timeout));
 		if (::connect(socket.get(), address->ai_addr, static_cast<int>(address->ai_addrlen)) == 0) {
@@ -317,7 +390,7 @@ SocketHandle connectPool(const brminer::PoolEndpoint& endpoint) {
 void sendAll(SOCKET socket, std::string_view data) {
 	std::size_t sent{};
 	while (sent < data.size()) {
-		const int count{send(socket, data.data() + sent,
+		const auto count{send(socket, data.data() + sent,
 							 static_cast<int>(std::min<std::size_t>(data.size() - sent, INT_MAX)), 0)};
 		if (count == SOCKET_ERROR || count == 0) {
 			throw std::runtime_error("Stratum send failed (Winsock " + std::to_string(WSAGetLastError()) + ").");
@@ -339,7 +412,7 @@ ReadResult readLine(SOCKET socket, std::string& buffer, std::string& line) {
 		}
 		if (buffer.size() > 1024 * 1024) throw std::runtime_error("Stratum message exceeded the 1 MiB safety limit.");
 		std::array<char, 4096> bytes{};
-		const int received{recv(socket, bytes.data(), static_cast<int>(bytes.size()), 0)};
+		const auto received{recv(socket, bytes.data(), static_cast<int>(bytes.size()), 0)};
 		if (received == 0) return ReadResult::closed;
 		if (received == SOCKET_ERROR) {
 			const int error{WSAGetLastError()};
@@ -413,6 +486,7 @@ void publishNotify(MinerState& state, const Notify& notify, const std::vector<st
 						  extra_nonce_counter, difficulty, ++state.next_job_id)};
 	state.next_nonce.store(0, std::memory_order_relaxed);
 	state.gpu_candidates.clear();
+	state.gpu_candidate_count = 0;
 	state.solution.reset();
 	state.solution_ready.store(false, std::memory_order_relaxed);
 	state.job = std::make_shared<const MiningJob>(std::move(job));
@@ -435,17 +509,19 @@ void handleStratumMessage(MinerState& state, const UniValue& message, bool& subs
 		if (submit_id && id == *submit_id) {
 			if (error.isNull() && result.isBool() && result.get_bool()) {
 				state.accepted_shares.fetch_add(1, std::memory_order_relaxed);
-				std::cout << "Pool accepted share." << std::endl;
 				if (pending_block_candidate) {
 					state.accepted_blocks.fetch_add(1, std::memory_order_relaxed);
 				}
+				state.console.event(pending_block_candidate ? "BLOCK ACCEPTED by the Stratum server." : "Share accepted by the Stratum server.");
 			}
 			else {
 				state.rejected_shares.fetch_add(1, std::memory_order_relaxed);
-				std::cerr << "BRminer Warthog: pool rejected a share";
-				if (!error.isNull()) std::cerr << ": " << error.write();
-				std::cerr << std::endl;
+				state.console.event(std::string{pending_block_candidate ? "BLOCK REJECTED" : "Share rejected"} +
+					(error.isNull() ? "." : ": " + error.write()));
 			}
+			state.console.shares(state.accepted_shares.load(std::memory_order_relaxed),
+				state.rejected_shares.load(std::memory_order_relaxed),
+				state.accepted_blocks.load(std::memory_order_relaxed));
 			submit_id.reset();
 			pending_block_candidate = false;
 			state.connected.store(true, std::memory_order_relaxed);
@@ -480,6 +556,7 @@ void handleStratumMessage(MinerState& state, const UniValue& message, bool& subs
 				throw std::runtime_error("Pool rejected the Warthog wallet address.");
 			}
 			authorized = true;
+			state.console.event("Payout address authorized; waiting for work.");
 			if (subscribed && latest_notify) {
 				publishNotify(state, *latest_notify, extra_nonce1, extra_nonce2_size,
 							  extra_nonce_counter, difficulty);
@@ -497,6 +574,9 @@ void handleStratumMessage(MinerState& state, const UniValue& message, bool& subs
 		difficulty = params[0].get_real();
 		if (!std::isfinite(difficulty) || difficulty <= 0.0) throw std::runtime_error("Pool sent a non-positive share difficulty.");
 		state.share_difficulty.store(difficulty, std::memory_order_relaxed);
+		std::ostringstream difficulty_message;
+		difficulty_message << "Share difficulty set to " << std::setprecision(5) << difficulty << '.';
+		state.console.event(difficulty_message.str());
 		if (latest_notify && subscribed && authorized) {
 			publishNotify(state, *latest_notify, extra_nonce1, extra_nonce2_size,
 						  extra_nonce_counter, difficulty);
@@ -504,6 +584,7 @@ void handleStratumMessage(MinerState& state, const UniValue& message, bool& subs
 	}
 	else if (method == "mining.notify") {
 		latest_notify = parseNotify(params);
+		state.console.event("New job received: " + latest_notify->job_id);
 		if (subscribed && authorized) {
 			publishNotify(state, *latest_notify, extra_nonce1, extra_nonce2_size,
 						  extra_nonce_counter, difficulty);
@@ -523,6 +604,15 @@ void handleStratumMessage(MinerState& state, const UniValue& message, bool& subs
 
 void miningWorker(MinerState& state, bool verify_gpu_candidates) {
 	std::uint64_t seen_job{};
+	std::shared_ptr<const MiningJob> gpu_job;
+	std::vector<Sha256tCandidate> gpu_batch;
+	#if defined(BRMINER_NATIVE_BATCH)
+	std::vector<PowResult> gpu_results;
+	#endif
+	if (verify_gpu_candidates) gpu_batch.reserve(kGpuCandidateTakeBatch);
+	#if defined(BRMINER_NATIVE_BATCH)
+	if (verify_gpu_candidates) gpu_results.reserve(kGpuCandidateTakeBatch);
+	#endif
 	while (!state.stop.load(std::memory_order_relaxed)) {
 		std::shared_ptr<const MiningJob> job;
 		{
@@ -546,8 +636,34 @@ void miningWorker(MinerState& state, bool verify_gpu_candidates) {
 				if (!state.job || state.job->id != seen_job) break;
 			}
 			if (verify_gpu_candidates) {
-				if (auto gpu_candidate{takeGpuCandidate(state)}) {
-					verifyGpuCandidate(state, std::move(*gpu_candidate));
+				if (takeGpuCandidates(state, gpu_job, gpu_batch)) {
+					std::uint64_t verified{};
+					#if defined(BRMINER_NATIVE_BATCH)
+					checkJanusHashFromShaWordBatch(gpu_job->header, gpu_batch,
+						gpu_job->share_difficulty, gpu_results);
+					#endif
+					for (std::size_t candidate_index{}; candidate_index < gpu_batch.size(); ++candidate_index) {
+						if ((candidate_index & 63U) == 0 &&
+							(state.stop.load(std::memory_order_relaxed) ||
+							 state.solution_ready.load(std::memory_order_relaxed))) break;
+						#if defined(BRMINER_NATIVE_BATCH)
+						const auto result{gpu_results[candidate_index]};
+						if (!result.meets_target && !result.meets_share_target) {
+							verified += result.sha256t_candidate;
+							continue;
+						}
+						const auto header{gpuCandidateHeader(*gpu_job, gpu_batch[candidate_index])};
+						#else
+						const auto header{gpuCandidateHeader(*gpu_job, gpu_batch[candidate_index])};
+						const auto result{checkJanusHashFromShaWord(header,
+							gpu_batch[candidate_index].sha_word, gpu_job->share_difficulty)};
+						#endif
+						verified += confirmGpuCandidate(state, gpu_job, gpu_batch[candidate_index],
+							header, result);
+					}
+					if (verified != 0) {
+						state.verushash_hashes.fetch_add(verified, std::memory_order_relaxed);
+					}
 					continue;
 				}
 			}
@@ -572,55 +688,131 @@ void miningWorker(MinerState& state, bool verify_gpu_candidates) {
 	}
 }
 
-void gpuWorker(MinerState& state, std::size_t device_index) {
+void gpuWorker(MinerState& state, std::size_t device_index,
+               bool use_cuda, std::string nvrtc_dll, std::uint32_t cuda_batch_size,
+               std::uint32_t cuda_block_size) {
 	bool registered{};
 	try {
-		OpenClSha256tMiner miner{device_index};
+                std::unique_ptr<OpenClSha256tMiner> opencl_miner;
+                std::unique_ptr<CudaSha256tMiner> cuda_miner;
+                if (use_cuda) {
+                        cuda_miner = std::make_unique<CudaSha256tMiner>(
+                                device_index, nvrtc_dll, cuda_block_size);
+                }
+                else opencl_miner = std::make_unique<OpenClSha256tMiner>(device_index);
 		auto last_threshold_adjustment{std::chrono::steady_clock::now()};
+		auto last_cpu_sha_hashes{state.cpu_sha256t_hashes.load(std::memory_order_relaxed)};
+		auto last_verus_hashes{state.verushash_hashes.load(std::memory_order_relaxed)};
+		auto last_gpu_sha_hashes{state.gpu_sha256t_hashes.load(std::memory_order_relaxed)};
+		auto last_gpu_scan_nanos{state.gpu_scan_nanos.load(std::memory_order_relaxed)};
 		state.gpu_workers_ready.fetch_add(1, std::memory_order_relaxed);
 		registered = true;
 		while (!state.stop.load(std::memory_order_relaxed)) {
 			std::shared_ptr<const MiningJob> job;
 			{
 				std::unique_lock lock{state.mutex};
+				const bool queue_limited{state.job &&
+					state.gpu_candidate_count > kGpuCandidateQueueLimit};
+				const auto wait_start{std::chrono::steady_clock::now()};
 				state.changed.wait(lock, [&] {
 					return state.stop.load(std::memory_order_relaxed) ||
 						   (state.job && !state.solution_ready.load(std::memory_order_relaxed) &&
 							state.next_nonce.load(std::memory_order_relaxed) <= UINT32_MAX &&
-									state.gpu_candidates.size() <= kGpuCandidateQueueLimit);
+									state.gpu_candidate_count <= kGpuCandidateQueueLimit);
 				});
+				if (queue_limited) {
+					state.gpu_queue_wait_nanos.fetch_add(
+						std::chrono::duration_cast<std::chrono::nanoseconds>(
+							std::chrono::steady_clock::now() - wait_start).count(),
+						std::memory_order_relaxed);
+				}
 				if (state.stop.load(std::memory_order_relaxed)) break;
 				job = state.job;
 			}
-			constexpr std::uint64_t batch_size{65536};
+                        const std::uint64_t batch_size{use_cuda ? cuda_batch_size : 4194304U};
 			const std::uint64_t start{state.next_nonce.fetch_add(batch_size, std::memory_order_relaxed)};
 			if (start > UINT32_MAX) continue;
 			const auto count{static_cast<std::uint32_t>(std::min<std::uint64_t>(batch_size,
 				static_cast<std::uint64_t>(UINT32_MAX) - start + 1))};
-			const auto candidates{miner.scan(job->header, static_cast<std::uint32_t>(start), count,
-				state.gpu_candidate_threshold.load(std::memory_order_relaxed))};
+			const auto scan_start{std::chrono::steady_clock::now()};
+                        const auto threshold{state.gpu_candidate_threshold.load(std::memory_order_relaxed)};
+                        auto candidates{use_cuda
+                                ? cuda_miner->scan(job->header, static_cast<std::uint32_t>(start), count, threshold)
+                                : opencl_miner->scan(job->header, static_cast<std::uint32_t>(start), count, threshold)};
+			if (state.benchmark && !candidates.empty()) {
+				for (const auto index : {std::size_t{0}, candidates.size() / 2, candidates.size() - 1}) {
+					Header check{job->header};
+					const auto& candidate{candidates[index]};
+					for (unsigned byte{}; byte < 4; ++byte)
+						check[76 + byte] = static_cast<std::uint8_t>(candidate.nonce >> (byte * 8));
+					const auto hash{sha256t(check)};
+					const std::uint32_t word{(static_cast<std::uint32_t>(hash[0]) << 24) |
+						(static_cast<std::uint32_t>(hash[1]) << 16) | (static_cast<std::uint32_t>(hash[2]) << 8) | hash[3]};
+					if (word != candidate.sha_word) throw std::runtime_error("Benchmark GPU sample failed CPU confirmation.");
+				}
+			}
+			const std::size_t candidate_count{candidates.size()};
+			state.gpu_scan_nanos.fetch_add(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - scan_start).count(),
+				std::memory_order_relaxed);
+			state.gpu_candidates_found.fetch_add(candidate_count, std::memory_order_relaxed);
 			state.gpu_sha256t_hashes.fetch_add(count, std::memory_order_relaxed);
 			{
 				std::lock_guard lock{state.mutex};
 				if (!state.stop.load(std::memory_order_relaxed) && state.job &&
 					state.job->id == job->id && !state.solution_ready.load(std::memory_order_relaxed)) {
-					for (const auto& candidate : candidates) {
-						state.gpu_candidates.push_back({job, candidate});
+					const std::size_t queued_before{state.gpu_candidate_count};
+					if (candidate_count != 0) {
+						state.gpu_candidates.push_back({job, std::move(candidates)});
+						state.gpu_candidate_count += candidate_count;
 					}
 					const auto now{std::chrono::steady_clock::now()};
-					if (now - last_threshold_adjustment >= kGpuThresholdAdjustmentInterval) {
+					if (device_index == 0 &&
+						now - last_threshold_adjustment >= kGpuThresholdAdjustmentInterval) {
+						const auto cpu_sha_hashes{state.cpu_sha256t_hashes.load(std::memory_order_relaxed)};
+						const auto verus_hashes{state.verushash_hashes.load(std::memory_order_relaxed)};
+						const auto gpu_sha_hashes{state.gpu_sha256t_hashes.load(std::memory_order_relaxed)};
+						const auto gpu_scan_nanos{state.gpu_scan_nanos.load(std::memory_order_relaxed)};
+						const auto cpu_sha_delta{cpu_sha_hashes - last_cpu_sha_hashes};
+						const auto verus_delta{verus_hashes - last_verus_hashes};
+						const auto gpu_sha_delta{gpu_sha_hashes - last_gpu_sha_hashes};
+						const auto gpu_scan_delta{gpu_scan_nanos - last_gpu_scan_nanos};
 						const double fraction{static_cast<double>(
 							state.gpu_candidate_threshold.load(std::memory_order_relaxed) -
 							kSha256tCandidateFloor) /
 							static_cast<double>(UINT32_MAX - kSha256tCandidateFloor)};
-						const std::size_t queue_size{state.gpu_candidates.size()};
-						const double adjusted_fraction{queue_size > kGpuCandidateQueueLimit / 4
-							? std::max(0.00005, fraction * 0.8)
-							: queue_size < kGpuCandidateQueueLimit / 8
-								? std::min(0.5, fraction * 1.01)
-								: fraction};
-						state.gpu_candidate_threshold.store(candidateThreshold(adjusted_fraction),
-							std::memory_order_relaxed);
+						if (gpu_sha_delta != 0 && gpu_scan_delta != 0) {
+							// GPU active-scan rate stays meaningful when queue backpressure
+							// suspends launches; wall-clock production does not.
+							const double interval_seconds{std::chrono::duration<double>(
+								now - last_threshold_adjustment).count()};
+							const double active_gpu_rate{static_cast<double>(gpu_sha_delta) *
+								1e9 / static_cast<double>(gpu_scan_delta)};
+							const double cpu_rate{static_cast<double>(verus_delta) / interval_seconds};
+							// Drain queued candidates over roughly two seconds, while
+							// retaining a half-queue buffer for dispatch jitter.
+							const double queue_correction{(
+								static_cast<double>(kGpuCandidateQueueLimit / 2) -
+								static_cast<double>(queued_before)) / 2.0};
+							double desired_rate{std::max(1.0, cpu_rate + queue_correction)};
+							if (cpu_sha_delta > std::max<std::uint64_t>(10000, verus_delta / 100) &&
+								queued_before < kGpuCandidateQueueLimit / 2) {
+								desired_rate = std::max(desired_rate, fraction * active_gpu_rate * 1.08);
+							}
+							const double target_fraction{std::clamp(desired_rate / active_gpu_rate,
+								kInitialGpuCandidateFraction, 0.25)};
+							const double adjusted_fraction{std::clamp(
+								0.5 * fraction + 0.5 * target_fraction,
+								kInitialGpuCandidateFraction, 0.25)};
+							state.gpu_candidate_floor.store(adjusted_fraction, std::memory_order_relaxed);
+							state.gpu_candidate_threshold.store(candidateThreshold(adjusted_fraction),
+								std::memory_order_relaxed);
+						}
+						last_cpu_sha_hashes = cpu_sha_hashes;
+						last_verus_hashes = verus_hashes;
+						last_gpu_sha_hashes = gpu_sha_hashes;
+						last_gpu_scan_nanos = gpu_scan_nanos;
 						last_threshold_adjustment = now;
 					}
 				}
@@ -629,13 +821,14 @@ void gpuWorker(MinerState& state, std::size_t device_index) {
 		}
 	}
 	catch (const std::exception& error) {
+		state.worker_failed.store(true, std::memory_order_relaxed);
 		{
 			std::lock_guard lock{state.mutex};
 			if (!state.gpu_error.empty()) state.gpu_error += "; ";
 			state.gpu_error += error.what();
 		}
 		state.changed.notify_all();
-		std::cerr << "BRminer Warthog: GPU worker stopped: " << error.what() << std::endl;
+		state.console.event(std::string{"ERROR: GPU worker stopped: "} + error.what());
 	}
 	if (registered) state.gpu_workers_ready.fetch_sub(1, std::memory_order_relaxed);
 }
@@ -648,6 +841,7 @@ void networkWorker(MinerState& state, std::string payout_address, brminer::PoolE
 		try {
 			SocketHandle socket{connectPool(endpoint)};
 			state.connected.store(true, std::memory_order_relaxed);
+			state.console.event("Connected to " + endpoint_name + '.');
 			sendAll(socket.get(), stratumRequest(kSubscribeId, "mining.subscribe", {"BRminer/1.0"}));
 			sendAll(socket.get(), stratumRequest(kAuthorizeId, "mining.authorize", {payout_address, "x"}));
 
@@ -696,6 +890,7 @@ void networkWorker(MinerState& state, std::string payout_address, brminer::PoolE
 						submit_id = next_id++;
 						pending_block_candidate = share->block_candidate;
 						sendAll(socket.get(), stratumSubmit(*share, *submit_id));
+						state.console.event(share->block_candidate ? "Block submitted; waiting for acceptance." : "Share submitted; waiting for acceptance.");
 						state.connected.store(true, std::memory_order_relaxed);
 					}
 				}
@@ -730,14 +925,14 @@ void networkWorker(MinerState& state, std::string payout_address, brminer::PoolE
 				std::lock_guard lock{state.mutex};
 				state.job.reset();
 				state.gpu_candidates.clear();
+				state.gpu_candidate_count = 0;
 				state.solution.reset();
 				state.solution_ready.store(false, std::memory_order_relaxed);
 				state.changed.notify_all();
 			}
 			const auto now{std::chrono::steady_clock::now()};
 			if (last_error != error.what() || now - last_error_time >= std::chrono::seconds{10}) {
-				std::cerr << "BRminer Warthog: pool connection error (" << endpoint_name << "): "
-					<< error.what() << std::endl;
+				state.console.event("ERROR: pool connection error (" + endpoint_name + "): " + error.what());
 				last_error = error.what();
 				last_error_time = now;
 			}
@@ -746,67 +941,197 @@ void networkWorker(MinerState& state, std::string payout_address, brminer::PoolE
 	}
 }
 
-#else
-
-void miningWorker(MinerState&, bool) {}
-void gpuWorker(MinerState&, std::size_t) {
-	throw std::runtime_error("Warthog GPU mining currently requires Windows OpenCL.");
-}
-void networkWorker(MinerState&, std::string, brminer::PoolEndpoint) {
-	throw std::runtime_error("Warthog Stratum mining currently requires Windows Winsock.");
-}
-
-#endif
-
 }  // namespace
 
-int runMiner(std::string_view payout_address, std::string_view thread_setting,
-			 std::string_view node_setting) {
-	validateAddress(payout_address);
+namespace {
+
+Header benchmarkHeader(std::uint64_t epoch) {
+	Header header{};
+	for (std::size_t i{}; i < header.size(); ++i) header[i] = static_cast<std::uint8_t>(i * 17 + 11);
+	std::fill(header.begin() + 32, header.begin() + 44, 0);
+	std::fill(header.begin() + 68, header.end(), 0);
+	for (unsigned i{}; i < 8; ++i) header[36 + i] = static_cast<std::uint8_t>(epoch >> (i * 8));
+	header[71] = 3;
+	header[75] = 1;
+	return header;
+}
+
+void publishBenchmarkJob(MinerState& state, std::uint64_t epoch) {
+	auto job{std::make_shared<MiningJob>()};
+	job->header = benchmarkHeader(epoch);
+	job->share_difficulty = 1e12;
+	std::lock_guard lock{state.mutex};
+	job->id = ++state.next_job_id;
+	state.job = std::move(job);
+	state.next_nonce.store(0, std::memory_order_relaxed);
+	state.gpu_candidates.clear();
+	state.gpu_candidate_count = 0;
+	state.changed.notify_all();
+}
+
+void benchmarkWorker(MinerState& state) {
+	std::uint64_t epoch{};
+	publishBenchmarkJob(state, epoch);
+	while (!state.stop.load(std::memory_order_relaxed)) {
+		if (state.next_nonce.load(std::memory_order_relaxed) > UINT32_MAX) publishBenchmarkJob(state, ++epoch);
+		std::this_thread::sleep_for(std::chrono::milliseconds{5});
+	}
+}
+
+void verifyBenchmarkCpu() {
+	const Header fixed{benchmarkHeader(0)};
+	constexpr std::array<std::uint8_t, 32> known{0x0f,0x0f,0xe5,0x90,0x6b,0x83,0x55,0x2d,
+		0x98,0x1d,0x2a,0x81,0x0e,0xbd,0x34,0x5b,0x13,0x78,0x6b,0x34,0x04,0x6b,0xb5,0xe6,
+		0xe6,0xcf,0x2c,0x58,0xc3,0x6d,0x1d,0x69};
+	if (sha256t(fixed) != known) throw std::runtime_error("Benchmark SHA256t known-answer check failed.");
+}
+
+template<typename Miner> void verifyBenchmarkGpu(Miner& miner) {
+	const Header fixed{benchmarkHeader(0)};
+	for (const auto start : {0U, 0xffffe000U}) {
+		constexpr std::uint32_t count{4096}, threshold{0x08000000U};
+		auto actual{miner.scan(fixed, start, count, threshold)};
+		std::sort(actual.begin(), actual.end(), [](const auto& a, const auto& b) { return a.nonce < b.nonce; });
+		std::vector<Sha256tCandidate> expected;
+		for (std::uint32_t i{}; i < count; ++i) {
+			Header header{fixed};
+			const auto nonce{start + i};
+			for (unsigned j{}; j < 4; ++j) header[76 + j] = static_cast<std::uint8_t>(nonce >> (j * 8));
+			const auto hash{sha256t(header)};
+			const std::uint32_t word{(static_cast<std::uint32_t>(hash[0]) << 24) |
+				(static_cast<std::uint32_t>(hash[1]) << 16) | (static_cast<std::uint32_t>(hash[2]) << 8) | hash[3]};
+			if (word >= kSha256tCandidateFloor && word < threshold) expected.push_back({nonce, word});
+		}
+		if (actual.size() != expected.size()) throw std::runtime_error("Benchmark GPU candidate count differs from CPU.");
+		for (std::size_t i{}; i < actual.size(); ++i)
+			if (actual[i].nonce != expected[i].nonce || actual[i].sha_word != expected[i].sha_word)
+				throw std::runtime_error("Benchmark GPU candidate differs from CPU.");
+	}
+}
+
+std::uint32_t launchSetting(const char* name, std::uint32_t fallback) {
+	const auto text{environmentValue(name)};
+	if (text.empty()) return fallback;
+	std::uint32_t value{};
+	const auto result{std::from_chars(text.data(), text.data() + text.size(), value)};
+	if (result.ec != std::errc{} || result.ptr != text.data() + text.size())
+		throw std::invalid_argument(std::string{name} + " must be an integer.");
+	return value;
+}
+
+} // namespace
+
+Header benchmarkFixtureHeader(std::uint64_t epoch) { return benchmarkHeader(epoch); }
+void verifyCudaBenchmarkWorkload(CudaSha256tMiner& miner) { verifyBenchmarkGpu(miner); }
+void verifyCpuBenchmarkWorkload() { verifyBenchmarkCpu(); }
+
+static int runEngine(std::string_view payout_address, std::string_view thread_setting,
+			 std::string_view node_setting, const BenchmarkOptions* benchmark = nullptr,
+			 BenchmarkResult* benchmark_result = nullptr, const TuningControls& tuning = {}) {
+	if (!benchmark) validateAddress(payout_address);
+	if (benchmark && (!std::isfinite(benchmark->duration_seconds) || benchmark->duration_seconds < 1 ||
+		benchmark->duration_seconds > 86400 || !std::isfinite(benchmark->warmup_seconds) ||
+		benchmark->warmup_seconds < 0 || benchmark->warmup_seconds > 3600))
+		throw std::invalid_argument("Benchmark duration must be 1..86400 seconds and warmup 0..3600 seconds.");
+	if (benchmark && (!std::isfinite(benchmark->initial_candidate_fraction) ||
+		benchmark->initial_candidate_fraction < kInitialGpuCandidateFraction || benchmark->initial_candidate_fraction > .25))
+		throw std::invalid_argument("Initial candidate fraction is outside the supported range.");
+	const char* benchmark_setting{std::getenv("BRMINER_BENCHMARK_TELEMETRY")};
+	const bool benchmark_telemetry{benchmark_setting && std::string_view{benchmark_setting} == "1"};
 	const brminer::PoolEndpoint endpoint{brminer::parsePoolEndpoint(node_setting)};
 	const unsigned int hardware_threads{std::thread::hardware_concurrency()};
-	const std::uint32_t thread_count{thread_setting.empty()
+	std::uint32_t thread_count{thread_setting.empty()
 		? std::max(1U, hardware_threads)
 		: static_cast<std::uint32_t>(brminer::parseThreadCount(thread_setting))};
+	auto cuda_batch_size{benchmark ? benchmark->cuda_batch_size :
+		(tuning.cuda_batch_size ? *tuning.cuda_batch_size : launchSetting("BRMINER_CUDA_BATCH_SIZE", 67108864))};
+	auto cuda_block_size{benchmark ? benchmark->cuda_block_size :
+		(tuning.cuda_block_size ? *tuning.cuda_block_size : launchSetting("BRMINER_CUDA_BLOCK_SIZE", 256))};
+	if (cuda_batch_size < 1048576 || cuda_batch_size > 67108864 || (cuda_batch_size & (cuda_batch_size - 1)))
+		throw std::invalid_argument("CUDA batch size must be a power of two from 1048576 to 67108864.");
+	if (cuda_block_size < 64 || cuda_block_size > 512 || (cuda_block_size & (cuda_block_size - 1)))
+		throw std::invalid_argument("CUDA block size must be 64, 128, 256, or 512.");
+	std::string requested_backend{benchmark ? benchmark->backend :
+		(tuning.backend.empty() ? environmentValue("BRMINER_GPU_BACKEND") : tuning.backend)};
+	if (requested_backend.empty()) requested_backend = "auto";
+	if (requested_backend != "auto" && requested_backend != "cpu" && requested_backend != "cuda" && requested_backend != "opencl")
+		throw std::invalid_argument("GPU backend must be auto, cpu, cuda, or opencl.");
 	std::vector<std::string> gpu_devices;
 	std::string gpu_detection_error;
-	try {
-		gpu_devices = OpenClSha256tMiner::devices();
+        std::string nvrtc_dll;
+        const auto explicit_compiler{benchmark ? benchmark->compiler_library : tuning.compiler_library};
+        const auto compilers{!explicit_compiler.empty() ? std::vector<std::string>{explicit_compiler} : nvrtcLibraries()};
+        bool use_cuda{};
+        if (requested_backend != "cpu" && requested_backend != "opencl") for (const auto& compiler : compilers) {
+                try {
+                        gpu_devices = CudaSha256tMiner::devices(compiler);
+                        use_cuda = !gpu_devices.empty();
+                        if (use_cuda) { nvrtc_dll = compiler; gpu_detection_error.clear(); break; }
+                }
+                catch (const std::exception& error) {
+                        gpu_detection_error = error.what();
+                }
+        }
+        if (requested_backend == "cuda" && !use_cuda)
+            throw std::runtime_error("CUDA backend unavailable: " + gpu_detection_error);
+        if (!use_cuda && requested_backend != "cpu") {
+                try {
+                        gpu_devices = OpenClSha256tMiner::devices();
+                }
+                catch (const std::exception& error) {
+                        if (!gpu_detection_error.empty()) gpu_detection_error += "; ";
+                        gpu_detection_error += error.what();
+                }
 	}
-	catch (const std::exception& error) {
-		gpu_detection_error = error.what();
+	if (requested_backend == "opencl" && gpu_devices.empty()) throw std::runtime_error("OpenCL backend unavailable.");
+	std::string tuning_message;
+	double initial_candidate_fraction{benchmark ? benchmark->initial_candidate_fraction : kInitialGpuCandidateFraction};
+	if (!benchmark && use_cuda) {
+		CalibrationConstraints fixed;
+		if (!thread_setting.empty()) fixed.threads = thread_count;
+		if (tuning.cuda_batch_size || !environmentValue("BRMINER_CUDA_BATCH_SIZE").empty()) fixed.batch_size = cuda_batch_size;
+		if (tuning.cuda_block_size || !environmentValue("BRMINER_CUDA_BLOCK_SIZE").empty()) fixed.block_size = cuda_block_size;
+		try {
+			const auto profile{resolveCalibration(nvrtc_dll, fixed, tuning)};
+			thread_count = profile.configuration.threads;
+			cuda_batch_size = profile.configuration.batch_size;
+			cuda_block_size = profile.configuration.block_size;
+			tuning_message = profile.message;
+			initial_candidate_fraction = profile.initial_candidate_fraction;
+		} catch (const CalibrationCancelled&) { throw; }
+		catch (const std::exception& error) {
+			tuning_message = std::string{"Calibration unavailable; using defaults/manual settings: "} + error.what();
+		}
+	}
+	if (benchmark) {
+		verifyBenchmarkCpu();
+		benchmark_result->options = *benchmark;
+		benchmark_result->options.threads = thread_count;
+		benchmark_result->compiler_library = nvrtc_dll;
+		benchmark_result->gpu_names = gpu_devices;
+		for (std::size_t i{}; i < gpu_devices.size(); ++i) {
+			if (use_cuda) {
+				CudaSha256tMiner verifier{i, nvrtc_dll, cuda_block_size};
+				verifyBenchmarkGpu(verifier);
+				benchmark_result->cuda_devices.push_back(verifier.identity());
+			} else {
+				OpenClSha256tMiner verifier{i};
+				verifyBenchmarkGpu(verifier);
+			}
+		}
+		benchmark_result->correctness_passed = true;
 	}
 
-#if defined(_WIN32)
 	WinsockRuntime winsock;
-#endif
 	g_stop_requested = 0;
 	const auto previous_sigint{std::signal(SIGINT, requestStop)};
 	const auto previous_sigterm{std::signal(SIGTERM, requestStop)};
 	MinerState state;
-	std::signal(SIGTERM, previous_sigterm);
+	state.benchmark = benchmark != nullptr;
+	state.gpu_candidate_floor.store(initial_candidate_fraction, std::memory_order_relaxed);
+	state.gpu_candidate_threshold.store(candidateThreshold(initial_candidate_fraction), std::memory_order_relaxed);
 	state.gpu_error = gpu_detection_error;
-	std::vector<std::thread> workers;
-	const std::uint32_t cpu_mining_workers{gpu_devices.empty()
-		? thread_count
-		: std::max(1U, (thread_count + 3) / 4)};
-	const std::uint32_t worker_count{thread_count +
-		(static_cast<std::uint32_t>(gpu_devices.size()) != 0 && cpu_mining_workers == thread_count ? 1U : 0U)};
-	workers.reserve(static_cast<std::size_t>(worker_count) + gpu_devices.size());
-	for (std::uint32_t i{}; i < worker_count; ++i) {
-		const bool verify_gpu_candidates{!gpu_devices.empty() && i >= cpu_mining_workers};
-		workers.emplace_back(miningWorker, std::ref(state), verify_gpu_candidates);
-	}
-	for (std::size_t i{}; i < gpu_devices.size(); ++i) {
-		workers.emplace_back(gpuWorker, std::ref(state), i);
-	}
-	std::thread network{networkWorker, std::ref(state), std::string{payout_address}, endpoint};
-
-	std::cout << "Warthog pool: " << endpoint.host << ":" << endpoint.port << std::endl;
-	if (!gpu_detection_error.empty()) {
-		std::cerr << "BRminer Warthog: GPU detection failed: " << gpu_detection_error << std::endl;
-	}
-	const std::string processor{processorDescription()};
+	const std::string processor{cpuDescription()};
 	std::string gpu_name{"CPU only"};
 	if (!gpu_devices.empty()) {
 		gpu_name.clear();
@@ -815,26 +1140,64 @@ int runMiner(std::string_view payout_address, std::string_view thread_setting,
 			gpu_name += device;
 		}
 	}
-	const int cpu_column_width{std::max<int>(12, static_cast<int>(processor.size()))};
-	const int gpu_column_width{std::max<int>(12, static_cast<int>(gpu_name.size()))};
-	constexpr int hashrate_column_width{18};
-	constexpr int difficulty_column_width{16};
-	constexpr int interval_column_width{15};
-	constexpr int share_column_width{17};
-	constexpr int blocks_column_width{12};
-	std::cout << std::left << std::setw(cpu_column_width) << "CPU NAME"
-			  << " | " << std::setw(gpu_column_width) << "GPU NAME"
-			  << " | " << std::right << std::setw(hashrate_column_width) << "HASHRATE"
-			  << " | " << std::setw(difficulty_column_width) << "POOL DIFFICULTY"
-			  << " | " << std::setw(interval_column_width) << "AVG SHARE TIME"
-			  << " | " << std::setw(share_column_width) << "SHARES ACCEPTED"
-			  << " | " << std::setw(share_column_width) << "SHARES REJECTED"
-			  << " | " << std::setw(blocks_column_width) << "BLOCKS FOUND" << std::endl;
+	const std::string backend{gpu_devices.empty() ? "CPU" : (use_cuda ? "CUDA" : "OpenCL")};
+	state.console.start(backend, thread_count, benchmark_telemetry || benchmark, benchmark && benchmark->quiet);
+	NvidiaMonitor monitor;
+	if (benchmark_result) {
+		benchmark_result->backend = backend;
+		benchmark_result->devices = monitor.sample();
+	}
+	state.console.event(benchmark ? "Offline benchmark: deterministic work sequence." : "Warthog pool: " + endpoint.host + ":" + endpoint.port);
+	state.console.event("Warthog GPU backend: " + backend);
+	state.console.event("CPU: " + processor);
+	state.console.event("GPU: " + gpu_name);
+	if (!tuning_message.empty()) state.console.event(tuning_message);
+	state.console.event("Janus combines CPU and GPU work. Estimated share time is not a countdown.");
+	if (!gpu_detection_error.empty())
+		state.console.event("GPU detection: " + gpu_detection_error);
+	if (!gpu_devices.empty() && !monitor.available())
+		state.console.event("GPU monitoring unavailable: " + monitor.unavailableReason());
+	std::vector<std::thread> workers;
+	const std::uint32_t cpu_mining_workers{gpu_devices.empty()
+		? thread_count : 0U};
+	const std::uint32_t worker_count{thread_count};
+	workers.reserve(static_cast<std::size_t>(worker_count) + gpu_devices.size());
+	for (std::uint32_t i{}; i < worker_count; ++i) {
+		const bool verify_gpu_candidates{!gpu_devices.empty() && i >= cpu_mining_workers};
+		workers.emplace_back(miningWorker, std::ref(state), verify_gpu_candidates);
+	}
+	for (std::size_t i{}; i < gpu_devices.size(); ++i) {
+                workers.emplace_back(gpuWorker, std::ref(state), i, use_cuda, nvrtc_dll, cuda_batch_size, cuda_block_size);
+	}
+	std::thread network;
+	if (benchmark) network = std::thread{benchmarkWorker, std::ref(state)};
+	else network = std::thread{networkWorker, std::ref(state), std::string{payout_address}, endpoint};
+	if (benchmark) {
+		const auto deadline{std::chrono::steady_clock::now() + std::chrono::seconds{60}};
+		while (state.gpu_workers_ready.load(std::memory_order_relaxed) < gpu_devices.size() &&
+			!state.worker_failed.load(std::memory_order_relaxed) && !g_stop_requested &&
+			std::chrono::steady_clock::now() < deadline)
+			std::this_thread::sleep_for(std::chrono::milliseconds{20});
+		if (state.gpu_workers_ready.load(std::memory_order_relaxed) < gpu_devices.size()) state.worker_failed.store(true);
+	}
+
 	std::uint64_t last_cpu_sha_hashes{};
 	std::uint64_t last_gpu_sha_hashes{};
 	std::uint64_t last_verus_hashes{};
+	std::uint64_t last_gpu_candidates{};
+	std::uint64_t last_gpu_scan_nanos{};
+	std::uint64_t last_gpu_queue_wait_nanos{};
+	if (benchmark) {
+		last_cpu_sha_hashes = state.cpu_sha256t_hashes.load(std::memory_order_relaxed);
+		last_gpu_sha_hashes = state.gpu_sha256t_hashes.load(std::memory_order_relaxed);
+		last_verus_hashes = state.verushash_hashes.load(std::memory_order_relaxed);
+		last_gpu_queue_wait_nanos = state.gpu_queue_wait_nanos.load(std::memory_order_relaxed);
+	}
 	auto last_sample{std::chrono::steady_clock::now()};
-	auto next_sample{last_sample + std::chrono::seconds{10}};
+	const auto run_start{last_sample};
+	double janus_work{};
+	const auto sample_period{std::chrono::seconds{benchmark ? 1 : 10}};
+	auto next_sample{last_sample + sample_period};
 	while (!g_stop_requested) {
 		while (!g_stop_requested && std::chrono::steady_clock::now() < next_sample) {
 			std::this_thread::sleep_for(std::chrono::milliseconds{50});
@@ -855,65 +1218,105 @@ int runMiner(std::string_view payout_address, std::string_view thread_setting,
 			state.suggested_share_difficulty.store(janus_score * kTargetShareIntervalSeconds,
 				std::memory_order_relaxed);
 		}
-		double displayed_rate{sha_rate};
-		const char* rate_unit{"H/s"};
-		if (sha_rate >= 1'000'000'000'000.0) {
-			displayed_rate /= 1'000'000'000'000.0;
-			rate_unit = "TH/s";
+		const double uptime{std::chrono::duration<double>(now - run_start).count()};
+		janus_work += janus_score * elapsed;
+		MiningStats stats{uptime, janus_score, janus_work / uptime,
+			gpu_sha_rate, cpu_sha_rate, verus_rate,
+			state.share_difficulty.load(std::memory_order_relaxed),
+			state.accepted_shares.load(std::memory_order_relaxed),
+			state.rejected_shares.load(std::memory_order_relaxed),
+			state.accepted_blocks.load(std::memory_order_relaxed)};
+		stats.gpus = monitor.sample();
+		if (!benchmark) state.console.update(stats);
+		else {
+			const double start{std::chrono::duration<double>(last_sample - run_start).count()};
+			const double end{std::min(uptime, benchmark->warmup_seconds + benchmark->duration_seconds)};
+			if (end > benchmark->warmup_seconds) {
+				BenchmarkSample sample;
+				sample.elapsed_s = end - benchmark->warmup_seconds;
+				sample.interval_s = end - std::max(start, benchmark->warmup_seconds);
+				sample.cpu_sha_hps = cpu_sha_rate;
+				sample.gpu_sha_hps = gpu_sha_rate;
+				sample.verus_hps = verus_rate;
+				sample.janus_hps = janus_score;
+				sample.gpus = stats.gpus;
+				const auto wait{state.gpu_queue_wait_nanos.load(std::memory_order_relaxed)};
+				sample.gpu_queue_wait_pct = static_cast<double>(wait - last_gpu_queue_wait_nanos) / (elapsed * 1e7);
+				{ std::lock_guard lock{state.mutex}; sample.queue_depth = state.gpu_candidate_count; }
+				benchmark_result->samples.push_back(std::move(sample));
+			}
+			if (static_cast<int>(uptime) % 5 == 0) state.console.event(
+				std::string{uptime <= benchmark->warmup_seconds ? "Warmup " : "Benchmark "} +
+				formatUptime(uptime) + " | Janus " + formatHashrate(janus_score));
+			last_gpu_queue_wait_nanos = state.gpu_queue_wait_nanos.load(std::memory_order_relaxed);
+			if (uptime >= benchmark->warmup_seconds + benchmark->duration_seconds || state.worker_failed.load()) break;
 		}
-		else if (sha_rate >= 1'000'000'000.0) {
-			displayed_rate /= 1'000'000'000.0;
-			rate_unit = "GH/s";
+		if (benchmark_telemetry) {
+			std::size_t queue_depth{};
+			{
+				std::lock_guard lock{state.mutex};
+				queue_depth = state.gpu_candidate_count;
+			}
+			const auto gpu_candidates{state.gpu_candidates_found.load(std::memory_order_relaxed)};
+			const auto gpu_scan_nanos{state.gpu_scan_nanos.load(std::memory_order_relaxed)};
+			const auto gpu_queue_wait_nanos{state.gpu_queue_wait_nanos.load(std::memory_order_relaxed)};
+			std::ostringstream metrics;
+			metrics << std::setprecision(12) << std::defaultfloat
+					<< "BRMINER_METRICS elapsed_s="
+					<< std::chrono::duration<double>(now - run_start).count()
+					<< " cpu_sha_hps=" << cpu_sha_rate
+					<< " gpu_sha_hps=" << gpu_sha_rate
+					<< " verus_hps=" << verus_rate
+					<< " janus_hps=" << janus_score
+					<< " gpu_candidates_hps=" <<
+						static_cast<double>(gpu_candidates - last_gpu_candidates) / elapsed
+					<< " gpu_queue_depth=" << queue_depth
+					<< " gpu_filter_threshold=" <<
+						state.gpu_candidate_threshold.load(std::memory_order_relaxed)
+					<< " gpu_filter_floor_fraction=" <<
+						state.gpu_candidate_floor.load(std::memory_order_relaxed)
+					<< " gpu_scan_busy_pct=" <<
+						static_cast<double>(gpu_scan_nanos - last_gpu_scan_nanos) / (elapsed * 1e7)
+					<< " gpu_queue_wait_pct=" <<
+						static_cast<double>(gpu_queue_wait_nanos - last_gpu_queue_wait_nanos) / (elapsed * 1e7);
+			state.console.diagnostic(metrics.str());
+			last_gpu_candidates = gpu_candidates;
+			last_gpu_scan_nanos = gpu_scan_nanos;
+			last_gpu_queue_wait_nanos = gpu_queue_wait_nanos;
 		}
-		else if (sha_rate >= 1'000'000.0) {
-			displayed_rate /= 1'000'000.0;
-			rate_unit = "MH/s";
-		}
-		else if (sha_rate >= 1'000.0) {
-			displayed_rate /= 1'000.0;
-			rate_unit = "kH/s";
-		}
-		std::ostringstream hashrate;
-		hashrate << std::setprecision(3) << std::defaultfloat << displayed_rate << ' ' << rate_unit;
-		const double pool_difficulty{state.share_difficulty.load(std::memory_order_relaxed)};
-		std::ostringstream difficulty_text;
-		if (pool_difficulty > 0.0) difficulty_text << std::fixed << std::setprecision(0) << pool_difficulty;
-		else difficulty_text << "waiting";
-		std::ostringstream interval_text;
-		if (pool_difficulty > 0.0 && std::isfinite(janus_score) && janus_score > 0.0) {
-			const double average_seconds{pool_difficulty / janus_score};
-			interval_text << '~' << std::setprecision(2) << std::defaultfloat;
-			if (average_seconds >= 3600.0) interval_text << average_seconds / 3600.0 << " h";
-			else if (average_seconds >= 60.0) interval_text << average_seconds / 60.0 << " min";
-			else interval_text << average_seconds << " s";
-		}
-		else interval_text << "waiting";
-		std::cout << std::left << std::setw(cpu_column_width) << processor
-				  << " | " << std::setw(gpu_column_width) << gpu_name
-				  << " | " << std::right << std::setw(hashrate_column_width) << hashrate.str()
-				  << " | " << std::setw(difficulty_column_width) << difficulty_text.str()
-				  << " | " << std::setw(interval_column_width) << interval_text.str()
-				  << " | " << std::setw(share_column_width)
-				  << state.accepted_shares.load(std::memory_order_relaxed)
-				  << " | " << std::setw(share_column_width)
-				  << state.rejected_shares.load(std::memory_order_relaxed)
-				  << " | " << std::setw(blocks_column_width)
-				  << state.accepted_blocks.load(std::memory_order_relaxed) << std::endl;
 		last_cpu_sha_hashes = cpu_sha_hashes;
 		last_gpu_sha_hashes = gpu_sha_hashes;
 		last_verus_hashes = verus_hashes;
 		last_sample = now;
-		next_sample += std::chrono::seconds{10};
-		while (next_sample <= now) next_sample += std::chrono::seconds{10};
+		next_sample += sample_period;
+		while (next_sample <= now) next_sample += sample_period;
 	}
 
+	if (benchmark_result) benchmark_result->elapsed_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - run_start).count();
 	state.stop.store(true, std::memory_order_relaxed);
 	state.changed.notify_all();
 	for (auto& worker : workers) worker.join();
 	network.join();
+	state.console.event("Mining stopped.");
 	std::signal(SIGINT, previous_sigint);
 	std::signal(SIGTERM, previous_sigterm);
+	if (benchmark) {
+		benchmark_result->cancelled = g_stop_requested != 0;
+		summarizeBenchmark(*benchmark_result);
+		if (state.worker_failed.load()) throw std::runtime_error("Benchmark worker failed: " + state.gpu_error);
+	}
 	return EXIT_SUCCESS;
+}
+
+int runMiner(std::string_view payout_address, std::string_view thread_setting, std::string_view node_setting,
+	const TuningControls& tuning) {
+	return runEngine(payout_address, thread_setting, node_setting, nullptr, nullptr, tuning);
+}
+
+BenchmarkResult runBenchmark(const BenchmarkOptions& options) {
+	BenchmarkResult result;
+	runEngine({}, options.threads ? std::to_string(options.threads) : "", {}, &options, &result);
+	return result;
 }
 
 }  // namespace brminer::warthog

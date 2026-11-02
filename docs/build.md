@@ -1,6 +1,6 @@
 # Build BRminer from source
 
-The fork is [JohnnyB813/BRminer](https://github.com/JohnnyB813/BRminer).
+The source repository is [Brage321/BRminer](https://github.com/Brage321/BRminer).
 Build Windows binaries on Windows and Linux binaries on Linux/WSL2; the
 source is shared, but this guide does not claim cross-compilation support.
 
@@ -22,7 +22,7 @@ Use a PowerShell session with the Visual Studio x64 build environment loaded
 assume vcpkg is installed at `C:\vcpkg`; change that path if needed:
 
 ```powershell
-git clone https://github.com/JohnnyB813/BRminer.git
+git clone https://github.com/Brage321/BRminer.git
 cd BRminer
 $env:VCPKG_ROOT = 'C:\vcpkg'
 $env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
@@ -68,7 +68,7 @@ On Ubuntu 24.04:
 sudo apt-get update
 sudo apt-get install build-essential clang cmake ninja-build git ca-certificates \
   curl python3 libboost-dev libssl-dev pkg-config
-git clone https://github.com/JohnnyB813/BRminer.git
+git clone https://github.com/Brage321/BRminer.git
 cd BRminer
 cmake -S . -B out/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++

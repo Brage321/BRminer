@@ -11,21 +11,77 @@ are loaded dynamically when a user selects CUDA at runtime.
 
 ## Windows x64
 
-Install Git, CMake 3.25+, Ninja, Python 3, and Visual Studio 2022 or newer with
-the **Desktop development with C++** workload and a Windows SDK. Install LLVM
-and put `clang-cl.exe` on PATH for the optimized native CPU batch implementation;
-otherwise the build uses its other available hashing paths. CPU instructions
-are selected at runtime rather than targeting the build computer's CPU.
+### 1. Install the required tools
 
-Use a PowerShell session with the Visual Studio x64 build environment loaded
-(for example, Developer PowerShell for VS, configured for x64). These commands
-assume vcpkg is installed at `C:\vcpkg`; change that path if needed:
+- Install [Git for Windows](https://git-scm.com/install/windows) and
+  [Python 3 for Windows](https://www.python.org/downloads/windows/). Make sure
+  `git` and `python` are available in a new PowerShell window.
+- Install [Visual Studio Build Tools 2022 or newer](https://visualstudio.microsoft.com/downloads/)
+  (or the full Visual Studio) using the **Desktop development with C++** workload.
+  In the installer's **Installation details**, include **MSVC x64/x86 build tools**,
+  a **Windows SDK**, and **C++ CMake tools for Windows**. The CMake component
+  provides CMake and Ninja, so separate installs are unnecessary when it is selected.
+  BRminer requires CMake 3.25 or newer.
+
+LLVM is optional for the first build. Without it, the build uses its other
+available hashing paths. To enable the optimized native CPU batch implementation,
+install the Windows x64 installer from the [LLVM releases](https://github.com/llvm/llvm-project/releases)
+and, before configuring CMake, run the following (adjust the path if needed):
+
+```powershell
+$env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
+clang-cl --version
+```
+
+CPU instructions are selected at runtime rather than targeting the build
+computer's CPU.
+
+### 2. Set up PowerShell
+
+Open **Developer PowerShell for VS** configured for x64. If you are already in a
+regular PowerShell window, you can load that environment there. For a default
+Visual Studio 2022 Build Tools installation, run:
+
+```powershell
+& 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\Launch-VsDevShell.ps1' -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
+```
+
+Adjust the path if Visual Studio is installed elsewhere. Skip this command if
+you opened Developer PowerShell directly. Add Visual Studio's bundled CMake and
+Ninja to this session's PATH, then check the tools:
+
+```powershell
+$vsCmake = Join-Path $env:VSINSTALLDIR 'Common7\IDE\CommonExtensions\Microsoft\CMake'
+$env:PATH = "$vsCmake\CMake\bin;$vsCmake\Ninja;$env:PATH"
+git --version
+python --version
+cmake --version
+ninja --version
+where.exe cl
+```
+
+Each command should find a tool; `cmake --version` must report 3.25 or newer.
+If `VSINSTALLDIR` is empty, the Visual Studio developer environment was not
+loaded. If CMake or Ninja is missing, check **C++ CMake tools for Windows** in
+the Visual Studio Installer and rerun this setup in a new PowerShell window.
+
+### 3. Set up vcpkg and build
+
+If `C:\vcpkg` does not exist yet, install vcpkg first:
+
+```powershell
+git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
+& C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
+```
+
+The commands below assume vcpkg is at `C:\vcpkg`; change `VCPKG_ROOT` if you
+installed it elsewhere. If you already cloned BRminer, `cd` to that checkout
+instead of cloning it again:
 
 ```powershell
 git clone https://github.com/Brage321/BRminer.git
 cd BRminer
 $env:VCPKG_ROOT = 'C:\vcpkg'
-$env:PATH = "C:\Program Files\LLVM\bin;$env:PATH"
 & "$env:VCPKG_ROOT\vcpkg.exe" install boost-multi-index:x64-windows-static boost-tuple:x64-windows-static
 cmake -S . -B out/build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release `
   "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
@@ -36,17 +92,9 @@ ctest --test-dir out/build/windows --output-on-failure
 .\brminer.exe --pow-self-test
 ```
 
-If vcpkg is not installed yet:
-
-```powershell
-git clone https://github.com/microsoft/vcpkg.git C:\vcpkg
-& C:\vcpkg\bootstrap-vcpkg.bat -disableMetrics
-```
-
-Run that bootstrap before the main build commands. The binary is written to
-the checkout root as `brminer.exe`. The MSVC runtime and Core dependencies are
-linked statically. If Ninja cannot find `cl.exe`, use an x64 Visual Studio
-developer environment. Visual Studio generators also work: use
+The binary is written to the checkout root as `brminer.exe`. The MSVC runtime
+and Core dependencies are linked statically. If Ninja cannot find `cl.exe`,
+repeat step 2. Visual Studio generators also work: use
 `-G 'Visual Studio 17 2022' -A x64` in a separate build folder, then add
 `--config Release` to the build and `-C Release` to CTest.
 

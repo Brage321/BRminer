@@ -26,8 +26,19 @@ inline std::optional<WarthogOptions> parseWarthogOptions(
 
     for (std::size_t i{}; i < args.size(); ++i) {
         const auto option{args[i]};
-        if (option == "--autotune") { defaults.tuning.autotune = true; continue; }
-        if (option == "--retune") { defaults.tuning.autotune = defaults.tuning.retune = true; continue; }
+        if (option == "--autotune") {
+            defaults.tuning.autotune = defaults.tuning.automatic_tuning = true;
+            continue;
+        }
+        if (option == "--no-autotune") {
+            defaults.tuning.automatic_tuning = false;
+            continue;
+        }
+        if (option == "--retune") {
+            defaults.tuning.autotune = defaults.tuning.retune =
+                defaults.tuning.automatic_tuning = true;
+            continue;
+        }
         if (i + 1 == args.size())
             throw std::invalid_argument("Missing value after " + std::string{option} + ". See --help.");
         const auto value{args[++i]};

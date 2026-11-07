@@ -74,7 +74,7 @@ bool satisfies(const LaunchConfiguration& value, const CalibrationConstraints& f
 
 LaunchConfiguration defaults(const CalibrationConstraints& fixed) {
     return {fixed.threads.value_or(std::min(1024U, std::max(1U, std::thread::hardware_concurrency()))),
-        fixed.batch_size.value_or(67108864), fixed.block_size.value_or(256)};
+        fixed.batch_size.value_or(4194304), fixed.block_size.value_or(256)};
 }
 
 UniValue configurationJson(const LaunchConfiguration& config) {
@@ -83,6 +83,18 @@ UniValue configurationJson(const LaunchConfiguration& config) {
     object.pushKV("batch_size", config.batch_size);
     object.pushKV("block_size", config.block_size);
     return object;
+}
+
+std::optional<double> storedInitialCandidateFraction(const std::string& text) {
+    try {
+        UniValue json;
+        if (!json.read(text) || !json.isObject() ||
+            !json["initial_candidate_fraction"].isNum()) return std::nullopt;
+        const double fraction{json["initial_candidate_fraction"].get_real()};
+        if (!std::isfinite(fraction) || fraction < 0.00005 || fraction > 0.25)
+            return std::nullopt;
+        return fraction;
+    } catch (const std::exception&) { return std::nullopt; }
 }
 
 UniValue constraintsJson(const CalibrationConstraints& fixed) {
@@ -241,7 +253,29 @@ bool repeatableImprovement(const ValidationEvidence& evidence) {
         if (ratio < 1.01) return false;
         improvement += ratio;
     }
-    return improvement / kRepeats >= 1.015;
+    return improvement / kRepeats >= 1.01;
+}
+
+std::optional<QuickCalibrationProfile> cachedQuickProfile(const std::string& text,
+    const std::string& expected_identity, const CalibrationConstraints& constraints) {
+    try {
+        UniValue json;
+        if (text.size() > 1024 * 1024 || !json.read(text) || !json.isObject() ||
+            json["schema"].get_str() != "brminer.quick-profile.v1" ||
+            json["hardware_key"].get_str() != expected_identity) return std::nullopt;
+        const auto& selected{json["selected"]};
+        QuickCalibrationProfile profile;
+        profile.configuration = {
+            selected["threads"].getInt<std::uint32_t>(),
+            selected["batch_size"].getInt<std::uint32_t>(),
+            selected["block_size"].getInt<std::uint32_t>()};
+        if (!validConfiguration(profile.configuration) ||
+            !satisfies(profile.configuration, constraints)) return std::nullopt;
+        const auto fraction{storedInitialCandidateFraction(text)};
+        if (!fraction) return std::nullopt;
+        profile.initial_candidate_fraction = *fraction;
+        return profile;
+    } catch (const std::exception&) { return std::nullopt; }
 }
 
 std::optional<LaunchConfiguration> validatedProfile(const std::string& text,
@@ -267,6 +301,8 @@ std::optional<LaunchConfiguration> validatedProfile(const std::string& text,
 CalibrationResolution resolveCalibration(const std::string& compiler,
     const CalibrationConstraints& fixed, const TuningControls& controls) {
     CalibrationResolution resolution;
+    const bool automatic_tuning{controls.automatic_tuning &&
+        environmentValue("BRMINER_AUTOTUNE") != "0"};
     resolution.configuration = defaults(fixed);
     if (!validConfiguration(resolution.configuration)) throw std::invalid_argument("Invalid calibration constraints.");
     if (fixed.threads && fixed.batch_size && fixed.block_size) {
@@ -275,32 +311,47 @@ CalibrationResolution resolveCalibration(const std::string& compiler,
         return resolution;
     }
     const auto folder{profileDirectory(controls)};
-    if (!controls.autotune && !controls.retune && !std::filesystem::is_directory(folder)) {
-        resolution.defaults_retained = true;
-        resolution.message = "No calibration profile; using defaults. Run --calibrate to tune this hardware.";
-        return resolution;
-    }
     const auto identity{hardwareIdentity(compiler, fixed)};
     const bool cache_allowed{!identity["driver_release"].get_str().empty()};
     if (!cache_allowed && controls.full_calibration)
         throw std::runtime_error("Driver release identity is unavailable; use quick calibration without a persistent validated profile.");
     const auto key{hashText(identity.write())};
     resolution.profile = folder / (key + ".json");
+    const auto quick_profile{folder / (key + ".quick.json")};
     if (cache_allowed && !controls.retune && std::filesystem::is_regular_file(resolution.profile) &&
         std::filesystem::file_size(resolution.profile) <= 1024 * 1024) {
         std::ifstream input{resolution.profile};
         const std::string text{std::istreambuf_iterator<char>{input}, {}};
         if (const auto cached{validatedProfile(text, key, fixed)}) {
             resolution.configuration = *cached;
+            if (const auto fraction{storedInitialCandidateFraction(text)})
+                resolution.initial_candidate_fraction = *fraction;
             resolution.cached = true;
             resolution.defaults_retained = *cached == defaults(fixed);
             resolution.message = "Loaded calibrated hardware profile: " + resolution.profile.string();
             return resolution;
         }
     }
-    if (!controls.autotune && !controls.retune) {
+    if (!controls.retune && std::filesystem::is_regular_file(quick_profile) &&
+        std::filesystem::file_size(quick_profile) <= 1024 * 1024) {
+        std::ifstream input{quick_profile};
+        const std::string text{std::istreambuf_iterator<char>{input}, {}};
+        if (const auto cached{cachedQuickProfile(text, key, fixed)}) {
+            resolution.configuration = cached->configuration;
+            resolution.initial_candidate_fraction = cached->initial_candidate_fraction;
+            resolution.profile = quick_profile;
+            resolution.cached = true;
+            resolution.provisional = true;
+            resolution.defaults_retained = cached->configuration == defaults(fixed);
+            resolution.message = "Loaded adaptive quick profile: " + quick_profile.string() +
+                ". Use --calibrate --full to replace it with repeated validation.";
+            return resolution;
+        }
+    }
+    if (!controls.autotune && !controls.retune && !automatic_tuning) {
         resolution.defaults_retained = true;
-        resolution.message = "No matching valid calibration profile; using defaults.";
+        resolution.profile.clear();
+        resolution.message = "No matching calibration profile and automatic tuning is disabled; using portable fallbacks.";
         return resolution;
     }
 
@@ -311,15 +362,28 @@ CalibrationResolution resolveCalibration(const std::string& compiler,
     std::filesystem::create_directories(report);
     const auto baseline{resolution.configuration};
     const auto quick{quickCalibration(compiler, fixed, report)};
+    resolution.initial_candidate_fraction = quick.initial_candidate_fraction;
     if (!controls.full_calibration) {
         resolution.configuration = quick.selected;
-        resolution.initial_candidate_fraction = quick.initial_candidate_fraction;
         resolution.calibrated = true;
+        resolution.provisional = true;
         resolution.defaults_retained = quick.selected == baseline;
-        resolution.profile.clear();
+        if (hashText(hardwareIdentity(compiler, fixed).write()) != key)
+            throw std::runtime_error("Hardware or compiler changed during calibration; no quick profile saved.");
+        UniValue profile{UniValue::VOBJ};
+        profile.pushKV("schema", "brminer.quick-profile.v1");
+        profile.pushKV("hardware_key", key);
+        profile.pushKV("identity", identity);
+        profile.pushKV("selected", configurationJson(resolution.configuration));
+        profile.pushKV("initial_candidate_fraction", resolution.initial_candidate_fraction);
+        profile.pushKV("evidence_directory", report.string());
+        if (!cachedQuickProfile(profile.write(), key, fixed))
+            throw std::runtime_error("Generated quick profile failed validation; no profile saved.");
+        writeTextAtomically(quick_profile, profile.write(2) + '\n');
+        resolution.profile = quick_profile;
         resolution.message = "Quick calibration completed in " + std::to_string(static_cast<unsigned>(std::ceil(quick.elapsed_seconds))) +
-            " s. Provisional plan only; no validated profile saved. Report: " + quick.report.string() +
-            ". Use --calibrate --full for repeated five-minute validation and profile saving.";
+            " s. Adaptive profile cached for this CPU/GPU/driver/compiler identity: " + quick_profile.string() +
+            ". It is provisional; use --calibrate --full for repeated five-minute validation.";
         return resolution;
     }
     const auto finalists{quick.finalists};
@@ -404,6 +468,7 @@ CalibrationResolution resolveCalibration(const std::string& compiler,
     profile.pushKV("hardware_key", key);
     profile.pushKV("identity", identity);
     profile.pushKV("selected", configurationJson(resolution.configuration));
+    profile.pushKV("initial_candidate_fraction", resolution.initial_candidate_fraction);
     profile.pushKV("defaults_retained", resolution.defaults_retained);
     profile.pushKV("validation", evidenceJson(selected_evidence));
     profile.pushKV("evidence_directory", report.string());
@@ -416,6 +481,7 @@ CalibrationResolution resolveCalibration(const std::string& compiler,
 int runCalibrationCommand(int argc, char** argv) {
     CalibrationConstraints fixed;
     TuningControls controls;
+    controls.automatic_tuning = false;
     controls.autotune = controls.retune = std::string{argv[1]} != "--calibration-status";
     const auto from_env = [&](const char* name, std::optional<std::uint32_t>& value) {
         const auto text{environmentValue(name)};
@@ -430,7 +496,7 @@ int runCalibrationCommand(int argc, char** argv) {
         if (option == "--help") {
             std::cout << "brminer --calibrate [--full] [--threads N] [--cuda-batch-size N] [--cuda-block-size N]\n"
                 "    [--nvrtc-library PATH] [--profile-dir DIRECTORY]\n"
-                "Omitted settings are tuned. Quick calibration produces a provisional session plan.\n"
+                "Omitted settings are tuned. Quick calibration caches a hardware-specific provisional plan.\n"
                 "--full confirms finalists with repeated five-minute runs and saves a validated profile.\n"
                 "--calibration-status checks cached settings without tuning.\n";
             return 0;

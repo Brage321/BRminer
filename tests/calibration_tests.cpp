@@ -40,6 +40,19 @@ std::string profile(brminer::warthog::LaunchConfiguration config,
     json.pushKV("validation", validation);
     return json.write();
 }
+
+std::string quickProfile(brminer::warthog::LaunchConfiguration config,
+    double initial_fraction = 0.025) {
+    UniValue json{UniValue::VOBJ}, selected{UniValue::VOBJ};
+    json.pushKV("schema", "brminer.quick-profile.v1");
+    json.pushKV("hardware_key", "hardware-driver-compiler-build-identity");
+    selected.pushKV("threads", config.threads);
+    selected.pushKV("batch_size", config.batch_size);
+    selected.pushKV("block_size", config.block_size);
+    json.pushKV("selected", selected);
+    json.pushKV("initial_candidate_fraction", initial_fraction);
+    return json.write();
+}
 }
 
 int main() try {
@@ -47,6 +60,8 @@ int main() try {
     const std::string identity{"hardware-driver-compiler-build-identity"};
     ValidationEvidence evidence{{100, 101}, {104, 105}, {300, 300}, {300, 300}, true, false, false};
     assert(repeatableImprovement(evidence));
+    ValidationEvidence one_percent{{100, 100}, {101.1, 101.1}, {300, 300}, {300, 300}, true, false, false};
+    assert(repeatableImprovement(one_percent));
     CalibrationConstraints fixed;
     fixed.threads = 14;
     assert(validatedProfile(profile({14, 16777216, 128}, evidence), identity, fixed));
@@ -54,6 +69,12 @@ int main() try {
     assert(!validatedProfile(profile({8, 16777216, 128}, evidence), identity, fixed));
     assert(!validatedProfile(profile({14, 16777216, 7}, evidence), identity, fixed));
     assert(!validatedProfile("{broken", identity, fixed));
+    const auto quick{cachedQuickProfile(quickProfile({14, 4194304, 256}), identity, fixed)};
+    assert((quick && quick->configuration == LaunchConfiguration{14, 4194304, 256}));
+    assert(quick->initial_candidate_fraction == 0.025);
+    assert(!cachedQuickProfile(quickProfile({8, 4194304, 256}), identity, fixed));
+    assert(!cachedQuickProfile(quickProfile({14, 4194304, 256}), "changed", fixed));
+    assert(!cachedQuickProfile(quickProfile({14, 4194304, 256}, 0.5), identity, fixed));
     auto failed{evidence};
     failed.candidate_hps = {100.5, 101.5};
     assert(!repeatableImprovement(failed));
@@ -78,7 +99,7 @@ int main() try {
     failed.candidate_hps[0] = std::numeric_limits<double>::quiet_NaN();
     assert(!repeatableImprovement(failed));
     evidence.candidate_hps = evidence.baseline_hps;
-    assert(validatedProfile(profile({14, 67108864, 256}, evidence, true), identity, fixed));
+    assert(validatedProfile(profile({14, 4194304, 256}, evidence, true), identity, fixed));
     assert(!validatedProfile(profile({14, 16777216, 128}, evidence, true), identity, fixed));
 
     const auto name{"brminer-profile-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json"};

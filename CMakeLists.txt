@@ -393,6 +393,12 @@ if(BUILD_TESTING)
     target_compile_features(config-tests PRIVATE cxx_std_17)
     add_test(NAME config-tests COMMAND config-tests)
 
+    add_executable(bounded-mpmc-ring-tests tests/bounded_mpmc_ring_tests.cpp)
+    target_compile_features(bounded-mpmc-ring-tests PRIVATE cxx_std_20)
+    target_include_directories(bounded-mpmc-ring-tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME bounded-mpmc-ring-tests COMMAND bounded-mpmc-ring-tests)
+
     add_executable(warthog-console-tests tests/warthog_console_tests.cpp src/warthog_console.cpp)
     target_compile_features(warthog-console-tests PRIVATE cxx_std_20)
     target_include_directories(warthog-console-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -447,7 +453,7 @@ if(BUILD_TESTING)
     add_test(NAME pow-tests COMMAND pow-tests)
 
     # Keep the assert-based checks active in Release, where CMake defines NDEBUG.
-    foreach(_assert_test IN ITEMS config-tests pow-tests warthog-pow-tests warthog-pow-equivalence-tests)
+    foreach(_assert_test IN ITEMS config-tests bounded-mpmc-ring-tests pow-tests warthog-pow-tests warthog-pow-equivalence-tests)
         if(MSVC)
             target_compile_options(${_assert_test} PRIVATE /UNDEBUG)
         else()

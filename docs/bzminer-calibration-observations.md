@@ -37,20 +37,23 @@ The installed version's logs are the stronger evidence for this particular run.
 
 ## BRminer workflow
 
-- Quick calibration measures a few CPU thread counts, probes GPU launch and
+- Quick calibration measures several CPU thread counts, probes the supported GPU launch and
   transfer capacity, and compares a small number of combined Janus configurations.
+- A challenger must beat the portable baseline by at least 1%, then preserve a
+  1% average gain in a reverse-order confirmation pair.
 - The measured capacities seed the existing adaptive candidate filter; feedback
   continues during mining.
-- Quick choices are provisional and can apply to the current explicitly tuned
-  session. A quick report is **not** a validated performance profile and is not
-  automatically loaded as one on later ordinary launches.
-- `--calibrate --full` confirms the short-listed configurations against defaults
+- Quick choices are provisional and cached under the exact hardware, driver,
+  compiler, build, and manual-constraint identity. Ordinary CUDA mining loads a
+  matching quick plan when no fully validated profile exists; it never reuses
+  another device's settings.
+- `--calibrate --full` confirms the short-listed configurations against fallbacks
   with repeated five-minute measurements. Only that evidence can promote a saved
-  profile. A matching validated profile avoids calibration on subsequent launches.
+  profile. A matching validated profile takes precedence on subsequent launches.
 - Manual CPU threads, batch size, and block size remain constraints in both modes.
 
-Target: finish the quick path within about two minutes on the available one-GPU
-host. Report actual elapsed time; do not promise a fixed duration on all hardware.
+Target: finish the quick path within about two to three minutes on the available
+one-GPU host. Report actual elapsed time; do not promise a fixed duration on all hardware.
 
 References:
 

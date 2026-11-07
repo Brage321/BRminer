@@ -20,19 +20,19 @@ supported tested versions, a ten-second check and nonstandard paths.
 Python and Visual Studio are not needed to run a release binary.
 
 On Windows, edit the pool and wallet in `mining-warthog.bat`, then run it.
-For example, a simple launcher using 14 CPU threads is:
+For example, this leaves the CPU and CUDA launch settings hardware-adaptive:
 
 ```bat
 @echo off
 cd /d "%~dp0"
-brminer.exe -a warthog -p us2.warthog.herominers.com:1143 -w YOUR-WARTHOG-WALLET --cpu_threads 14
+brminer.exe -a warthog -p us2.warthog.herominers.com:1143 -w YOUR-WARTHOG-WALLET
 pause
 ```
 
 On Linux, edit `mining-warthog.sh`, then run `./mining-warthog.sh`, or:
 
 ```sh
-./brminer -a warthog -p us2.warthog.herominers.com:1143 -w YOUR-WARTHOG-WALLET --cpu_threads 14
+./brminer -a warthog -p us2.warthog.herominers.com:1143 -w YOUR-WARTHOG-WALLET
 ```
 
 For solo mining, replace the endpoint with your Warthog Stratum node,
@@ -41,7 +41,9 @@ for example `YOUR-NODE:3456`. Use a wallet you control. Endpoint formats accept
 instructions and terms for your region. Press Ctrl+C to stop; Linux SIGTERM
 also shuts down cleanly.
 
-Omit `--cpu_threads` to use all logical CPU threads. `--backend cuda`,
+On the first CUDA launch without a matching profile, BRminer measures CPU
+worker count, CUDA batch/block sizes, and combined balance, then caches the
+hardware-specific quick plan. Later launches reuse it. `--backend cuda`,
 `--backend opencl` and `--backend cpu` explicitly select a backend. Automatic
 mode tries CUDA, OpenCL, then CPU. Confirm the backend printed at startup.
 A missing CUDA installation can therefore still allow mining with a fallback.
@@ -60,15 +62,21 @@ brminer.exe --calibration-status
 Use `./brminer` on Linux. The benchmark launcher runs five measured minutes
 after warmup. Use `--backend cpu` when CUDA is not installed.
 
-Quick calibration screens CPU worker count, CUDA launch sizes and combined
-Janus performance. It took about 69 seconds on the tested one-GPU host; duration
-varies with hardware. The quick plan is provisional. Add `--autotune` to a
-mining command to use it immediately, or use `--calibrate --full` for repeated
-five-minute validation and a saved profile. Normal CUDA mining reloads a
-matching validated profile without benchmarking. Manual overrides remain fixed.
+Quick calibration screens CPU worker count, the full supported CUDA batch
+ladder, block sizes, and combined Janus performance. A combined candidate must
+show at least a 1% gain and repeat that gain in a reverse-order confirmation.
+It takes roughly two to three minutes on the tested one-GPU host; duration
+varies with hardware. The cached quick plan is provisional; a matching fully
+validated profile takes precedence. Use `--calibrate --full` for repeated
+five-minute validation, `--retune` after a system change, or `--no-autotune` to
+skip a missing-profile measurement. Manual overrides remain fixed.
 
-Default CUDA settings are 67,108,864 nonces per batch and 256 threads per block.
-Override them with `--cuda-batch-size` and `--cuda-block-size`.
+If calibration is disabled or unavailable, the portable CUDA fallbacks are
+all logical CPU threads, 4,194,304 nonces per batch, and 256 threads per block.
+They are safety fallbacks, not a claim that one configuration is optimal on
+every device. Override them with `--cpu_threads`, `--cuda-batch-size`, and
+`--cuda-block-size`; `BRMINER_AUTOTUNE=0` is the environment equivalent of
+`--no-autotune`.
 Environment equivalents include `BRMINER_THREADS`,
 `BRMINER_CUDA_BATCH_SIZE`, `BRMINER_CUDA_BLOCK_SIZE`, and
 `BRMINER_NVRTC_LIBRARY` (`BRMINER_NVRTC_DLL` also works).

@@ -57,9 +57,9 @@ Core. They share the executable/build, with independent workers and protocols.
 | Component | Role |
 | --- | --- |
 | `src/warthog_benchmark.cpp` | CLI, versioned JSON and interval-weighted statistics. The engine's `runBenchmark` reuses real workers with deterministic work and CPU-checked GPU candidates. |
-| `src/quick_calibration.cpp` | Measures Verus, GPU SHA and pinned transfers, probes launch dimensions, seeds the filter and screens combined Janus throughput. Produces a provisional report. |
-| `src/calibration.cpp` | Validates defaults/finalists twice for five measured minutes each. Correctness, stability and repeatable gains gate atomic profile replacement. |
-| Profile identity | CPU/threads, OS, GPU UUIDs/architectures, driver, compiler/builtins hashes, build and manual constraints form the key. Invalid/stale profiles fall back to defaults/manual settings. |
+| `src/quick_calibration.cpp` | Measures Verus, GPU SHA and pinned transfers, probes launch dimensions, seeds the filter and screens combined Janus throughput. A 1%+ challenger is confirmed in reverse order before selection. Produces a provisional hardware plan. |
+| `src/calibration.cpp` | Caches provisional plans by hardware identity and validates fallbacks/finalists twice for five measured minutes each. Correctness, stability and repeatable gains gate the higher-trust profile. |
+| Profile identity | CPU/threads, OS, GPU UUIDs/architectures, driver, compiler/builtins hashes, build and manual constraints form the key. Invalid/stale profiles trigger fresh automatic quick tuning or, when disabled, portable fallbacks. |
 | `src/platform.cpp` | Library loading, executable location, CPU/OS identity, environment lookup and atomic text replacement. |
 
 See [commands and cache rules](benchmark-calibration.md) and

@@ -320,7 +320,8 @@ int main(int argc, char* argv[]) {
             std::cout << "Quick calibration: brminer --calibrate [--profile-dir DIRECTORY] [--threads N]\n"
                 "  Add --full for repeated five-minute validation and a saved hardware profile.\n"
                 "  --calibration-status checks cached settings; --retune recalibrates.\n"
-                "Mining automatically loads matching profiles. Add --autotune to tune if missing.\n"
+                "Mining automatically tunes once if no matching profile exists, then caches the plan.\n"
+                "Use --no-autotune for portable fallbacks or --retune to measure again.\n"
                 "Manual thread, batch, and block settings remain fixed during calibration.\n";
             return EXIT_SUCCESS;
         }

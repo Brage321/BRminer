@@ -13,7 +13,7 @@ brminer.exe --benchmark --backend cuda --duration 300 --warmup 30 --json benchma
 
 No node or wallet is required. `benchmark-warthog.bat` / `.sh` runs this command.
 An optional `--threads 14` fixes the worker count. Batch and block sizes can be
-fixed with `--cuda-batch-size 67108864 --cuda-block-size 256`.
+fixed with `--cuda-batch-size 4194304 --cuda-block-size 256`.
 `--backend cpu` exercises the portable CPU path without a GPU.
 
 The deterministic `warthog-header-sequence-v1` workload starts with a fixed
@@ -44,20 +44,35 @@ WSL and native Windows are not a controlled algorithm comparison.
 brminer.exe --calibrate
 ```
 
-This produces a provisional plan and JSON evidence. It measures CPU Verus
-capacity at several thread counts, NVIDIA SHA and pinned-transfer capacity, a
-small CUDA launch-size shortlist, then combined Janus throughput. Capacity
+This produces a provisional plan, caches it for the exact hardware identity,
+and retains JSON evidence. It measures CPU Verus
+capacity at several thread counts, NVIDIA SHA and pinned-transfer capacity, the
+full supported power-of-two batch ladder and block sizes, then combined Janus
+throughput. Capacity
 measurements seed the adaptive candidate filter. Feedback continues while mining.
-Available-host quick runs finished in 68–73 seconds. Duration varies with
-hardware and GPU count; this is a short screening procedure, not a sustained
-performance guarantee. See [the BzMiner observations](bzminer-calibration-observations.md)
+The combined screen keeps the portable baseline unless a challenger is at least
+1% faster. A qualifying challenger is measured again before the baseline, so
+the two-run averages bracket temperature, clocks, and background-system drift.
+Available-host quick runs take roughly two minutes, or about two and a half when
+confirmation is needed. Duration varies with hardware and GPU count; this is a
+short screening procedure, not a sustained performance guarantee. See
+[the BzMiner observations](bzminer-calibration-observations.md)
 for the independent approach inferred from its logs.
 
-To use a quick plan immediately while mining, add `--autotune` to the normal
-mining command. A matching validated profile takes precedence; `--retune`
-explicitly requests a new quick plan. A standalone `--calibrate` command prints
-its plan and exits. Quick reports are not automatically loaded as trusted
-profiles on later ordinary launches.
+Normal CUDA mining performs this quick calibration automatically when neither a
+validated profile nor a matching quick profile exists. Later launches load the
+cached plan without benchmarking. A matching validated profile takes
+precedence; `--retune` explicitly requests a fresh quick plan. Use
+`--no-autotune` when startup measurement is undesirable and portable fallbacks
+are preferred (`BRMINER_AUTOTUNE=0` is equivalent). A standalone `--calibrate`
+command refreshes the quick plan,
+prints it, and exits.
+
+Quick profiles remain marked provisional: they are selected by short capacity
+and combined screens, not promoted by a single result to the same trust level
+as full validation. CPU/GPU, driver/API, NVRTC compiler and builtins, OS, miner
+build, and manual-constraint changes produce a different cache identity and
+therefore a new measurement rather than reusing another machine's settings.
 
 ## Full validation and saved profiles
 
@@ -72,13 +87,14 @@ is reversed on the second pass. Allow roughly 12–35 minutes, depending on the
 shortlist and startup overhead.
 
 A candidate must improve both paired comparisons by at least 1%, with a mean
-ratio of at least 1.5%. Incorrect, cancelled, thermally limited, short, or noisy
+ratio of at least 1%. Incorrect, cancelled, thermally limited, short, or noisy
 runs cannot promote a profile. Per-run coefficient of variation must be at most
 10%, and baseline repeat drift at most 5%. Without convincing improvement,
 stable defaults are saved; inconclusive validation leaves defaults in use and
 does not save a new profile.
 
-Normal CUDA mining loads a valid matching profile without benchmarking. Check it:
+Normal CUDA mining loads a matching fully validated profile before considering
+a quick profile. Check the active cached choice:
 
 ```bat
 brminer.exe --calibration-status
@@ -89,8 +105,9 @@ capabilities, driver release/API, compiler/builtins file hashes, miner build,
 manual constraints, and disabled-SIMD state. Changes invalidate the match.
 Malformed, oversized, stale, or out-of-range profiles are ignored. Atomic file
 replacement protects an existing profile from a partial write. NVML driver
-identity is required for persistent validation; quick tuning and mining remain
-usable without monitoring.
+identity is required for persistent full validation; quick profiles also carry
+the CUDA driver API, compiler and builtins identity and remain usable without
+NVML monitoring.
 
 Default folders are `%LOCALAPPDATA%\BRminer\profiles` on Windows and
 `$XDG_CACHE_HOME/brminer/profiles` or `~/.cache/brminer/profiles` on Linux.
@@ -112,8 +129,9 @@ settings. The environment equivalents are `BRMINER_THREADS`,
 means there is nothing left to tune.
 
 The supported batch range is powers of two from 1,048,576 to 67,108,864 nonces;
-block sizes are 64, 128, 256, or 512. Defaults are all logical CPU threads,
-67,108,864 nonces, and block size 256. CPU feature dispatch checks capabilities,
+block sizes are 64, 128, 256, or 512. The no-calibration fallbacks are all
+logical CPU threads, 4,194,304 nonces, and block size 256. These are conservative
+fallbacks, not universal optimums. CPU feature dispatch checks capabilities,
 not brand/model names. Calibration changes no clocks, voltage, or power limits.
 
 ## Test another Windows PC

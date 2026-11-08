@@ -37,6 +37,7 @@ int main() {
         "-w", "testwallet", "--cpu_threads", "14"});
     assert(mining && mining->pool == "node.example.net:3456");
     assert(mining->wallet == "testwallet" && mining->threads == "14");
+    assert(mining->tuning.automatic_tuning);
     assert(!parseWarthogOptions({"-regtest"}));
     const auto inherited = parseWarthogOptions({"-a", "wart", "-w", "newwallet"},
         {"oldwallet", "4", "pool.example.net:3033"});
@@ -46,6 +47,8 @@ int main() {
     assert(tuning->tuning.autotune && tuning->tuning.retune);
     assert(*tuning->tuning.cuda_batch_size == 16777216 && *tuning->tuning.cuda_block_size == 128);
     assert(tuning->tuning.profile_directory == "profiles");
+    const auto no_autotune = parseWarthogOptions({"-a", "warthog", "--no-autotune"});
+    assert(no_autotune && !no_autotune->tuning.automatic_tuning);
     for (const auto& args : std::vector<std::vector<std::string_view>>{
             {"-a", "warthog", "-w"}, {"-a", "warthog", "--cpu_threads", "0"},
             {"-a", "unknown"}, {"-a", "warthog", "--typo", "1"},

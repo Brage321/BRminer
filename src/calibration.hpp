@@ -20,7 +20,12 @@ struct CalibrationResolution {
     LaunchConfiguration configuration;
     std::string message;
     std::filesystem::path profile;
-    bool cached{}, calibrated{}, defaults_retained{};
+    bool cached{}, calibrated{}, defaults_retained{}, provisional{};
+    double initial_candidate_fraction{0.00005};
+};
+
+struct QuickCalibrationProfile {
+    LaunchConfiguration configuration;
     double initial_candidate_fraction{0.00005};
 };
 
@@ -31,6 +36,8 @@ struct ValidationEvidence {
 };
 
 bool repeatableImprovement(const ValidationEvidence& evidence);
+std::optional<QuickCalibrationProfile> cachedQuickProfile(const std::string& json,
+    const std::string& expected_identity, const CalibrationConstraints& constraints);
 std::optional<LaunchConfiguration> validatedProfile(const std::string& json,
     const std::string& expected_identity, const CalibrationConstraints& constraints);
 CalibrationResolution resolveCalibration(const std::string& compiler_library,

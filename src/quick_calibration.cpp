@@ -15,6 +15,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <thread>
 
 namespace brminer::warthog {
@@ -112,7 +113,7 @@ QuickCalibrationPlan quickCalibration(const std::string& compiler,
     const CalibrationConstraints& fixed, const std::filesystem::path& folder) {
     const auto started{Clock::now()};
     const auto hardware{std::min(1024U, std::max(1U, std::thread::hardware_concurrency()))};
-    const LaunchConfiguration baseline{fixed.threads.value_or(hardware), fixed.batch_size.value_or(67108864),
+    const LaunchConfiguration baseline{fixed.threads.value_or(hardware), fixed.batch_size.value_or(4194304),
         fixed.block_size.value_or(256)};
     QuickCalibrationPlan plan;
     verifyCpuBenchmarkWorkload();
@@ -127,7 +128,9 @@ QuickCalibrationPlan quickCalibration(const std::string& compiler,
 
     std::cout << "Quick calibration 1/3: CPU Verus capacity.\n" << std::flush;
     std::vector<std::uint32_t> counts{baseline.threads};
-    if (!fixed.threads) counts = {std::max(1U, hardware / 2), hardware > 2 ? hardware - 2 : hardware, hardware};
+    if (!fixed.threads) counts = {std::max(1U, hardware / 2),
+        hardware > 2 ? hardware - 2 : hardware,
+        hardware > 1 ? hardware - 1 : hardware, hardware};
     std::sort(counts.begin(), counts.end());
     counts.erase(std::unique(counts.begin(), counts.end()), counts.end());
     std::map<std::uint32_t, double> cpu_rates;
@@ -189,35 +192,45 @@ QuickCalibrationPlan quickCalibration(const std::string& compiler,
     if (best_block == block_rates.end() || best_block->second <= 0) throw std::runtime_error("No correct CUDA launch configuration.");
     std::uint32_t selected_block{best_block->first};
     if (block_rates[baseline.block_size] >= best_block->second * .99) selected_block = baseline.block_size;
-    const double raw_gpu_rate{block_rates[selected_block]};
-    std::uint32_t derived_batch{1048576};
-    const double desired{raw_gpu_rate / miners.size() * .060};
-    while (derived_batch < 67108864 && derived_batch * 2.0 <= desired) derived_batch *= 2;
     std::vector<std::uint32_t> batches{baseline.batch_size};
     if (!fixed.batch_size) {
-        batches.push_back(derived_batch);
-        batches.push_back(std::max(1048576U, derived_batch / 2));
-        batches.push_back(std::min(67108864U, derived_batch * 2));
+        batches = {1048576, 2097152, 4194304, 8388608,
+            16777216, 33554432, 67108864};
     }
     std::sort(batches.begin(), batches.end());
     batches.erase(std::unique(batches.begin(), batches.end()), batches.end());
     std::map<std::uint32_t, double> batch_rates;
     UniValue batch_probes{UniValue::VARR};
     for (const auto batch : batches) {
-        double rate{};
         try {
-            for (auto& miner : miners) { miner->setBlockSize(selected_block); rate += gpuCapacity(*miner, batch, 1.5); }
+            std::array<double, 2> repetitions{};
+            for (auto& repetition : repetitions) {
+                for (auto& miner : miners) {
+                    miner->setBlockSize(selected_block);
+                    repetition += gpuCapacity(*miner, batch, 1.0);
+                }
+            }
+            std::sort(repetitions.begin(), repetitions.end());
+            const double rate{(repetitions[0] + repetitions[1]) / 2.0};
             batch_rates[batch] = rate;
             UniValue probe{UniValue::VOBJ};
             probe.pushKV("batch_size", batch);
             probe.pushKV("sha_hps", rate);
+            UniValue measured{UniValue::VARR};
+            for (const auto repetition : repetitions) measured.push_back(repetition);
+            probe.pushKV("rates_hps", std::move(measured));
             batch_probes.push_back(std::move(probe));
         } catch (const std::exception& error) { std::cout << "  Batch " << batch << " rejected: " << error.what() << '\n'; }
     }
     const auto best_batch{std::max_element(batch_rates.begin(), batch_rates.end(), [](const auto& a, const auto& b) { return a.second < b.second; })};
     if (best_batch == batch_rates.end() || best_batch->second <= 0) throw std::runtime_error("No usable CUDA batch size.");
     std::uint32_t selected_batch{best_batch->first};
-    if (batch_rates[baseline.batch_size] >= best_batch->second * .99) selected_batch = baseline.batch_size;
+    for (const auto& [batch, rate] : batch_rates) {
+        if (rate >= best_batch->second * .99) {
+            selected_batch = batch;
+            break;
+        }
+    }
     plan.gpu_capacity_hps = batch_rates[selected_batch];
     std::cout << "  GPU SHA capacity: " << formatHashrate(plan.gpu_capacity_hps) << '\n' << std::flush;
     miners.clear();
@@ -238,7 +251,7 @@ QuickCalibrationPlan quickCalibration(const std::string& compiler,
     bool baseline_valid{};
     std::cout << "Quick calibration 3/3: combined Janus and filter balance.\n" << std::flush;
     unsigned index{};
-    for (const auto& config : configurations) {
+    const auto measure_combined = [&](const LaunchConfiguration& config, std::string_view phase) {
         BenchmarkOptions options;
         options.threads = config.threads;
         options.cuda_batch_size = config.batch_size;
@@ -256,22 +269,47 @@ QuickCalibrationPlan quickCalibration(const std::string& compiler,
             writeTextAtomically(folder / filename, benchmarkJson(result));
             const bool valid{result.correctness_passed && !thermalLimited(result) &&
                 result.mean_janus_hps > 0 && result.stddev_janus_hps / result.mean_janus_hps <= .25};
-            if (config == baseline) { baseline_rate = result.mean_janus_hps; baseline_valid = valid; }
-            if (valid) ranked.push_back({config, result.mean_janus_hps});
             UniValue probe{UniValue::VOBJ};
             probe.pushKV("configuration", configJson(config));
             probe.pushKV("janus_hps", result.mean_janus_hps);
             probe.pushKV("correct_and_stable", valid);
+            probe.pushKV("phase", std::string{phase});
             probe.pushKV("result_file", filename);
             combined.push_back(std::move(probe));
             std::cout << "  " << config.threads << " threads, batch " << config.batch_size << ", block "
                 << config.block_size << ": " << formatHashrate(result.mean_janus_hps) << " Janus\n" << std::flush;
+            return std::pair{valid, result.mean_janus_hps};
         } catch (const CalibrationCancelled&) { throw; }
         catch (const std::exception& error) { std::cout << "  Combined candidate rejected: " << error.what() << '\n'; }
+        return std::pair{false, 0.0};
+    };
+    for (const auto& config : configurations) {
+        const auto [valid, rate]{measure_combined(config, "screen")};
+        if (config == baseline) { baseline_rate = rate; baseline_valid = valid; }
+        if (valid) ranked.push_back({config, rate});
     }
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.rate > b.rate; });
     if (ranked.empty()) throw std::runtime_error("Quick calibration found no correct, stable combined configuration.");
-    if (!baseline_valid || ranked.front().rate >= baseline_rate * 1.01) plan.selected = ranked.front().config;
+    if (baseline_valid && !(ranked.front().config == baseline) && ranked.front().rate >= baseline_rate * 1.01) {
+        const auto challenger{ranked.front()};
+        std::cout << "  Confirming the short-run winner against the portable baseline.\n" << std::flush;
+        // The screen starts with the baseline and reaches the winner later. Reversing that order here
+        // brackets both configurations against temperature, clocks, and background-system drift.
+        const auto [challenger_valid, challenger_rate]{measure_combined(challenger.config, "confirmation")};
+        const auto [baseline_confirmation_valid, baseline_confirmation_rate]{measure_combined(baseline, "confirmation")};
+        const bool challenger_confirmed{challenger_valid && baseline_confirmation_valid};
+        if (challenger_confirmed) {
+            const double challenger_average{(challenger.rate + challenger_rate) / 2.0};
+            for (auto& item : ranked) {
+                if (item.config == challenger.config) item.rate = challenger_average;
+                if (item.config == baseline) item.rate = (item.rate + baseline_confirmation_rate) / 2.0;
+            }
+            baseline_rate = (baseline_rate + baseline_confirmation_rate) / 2.0;
+            if (challenger_average >= baseline_rate * 1.01) plan.selected = challenger.config;
+            std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.rate > b.rate; });
+        }
+    }
+    if (!baseline_valid) plan.selected = ranked.front().config;
     for (const auto& item : ranked) {
         if (plan.finalists.size() >= 2) break;
         // Clearly slower short runs do not justify another ten minutes of validation.

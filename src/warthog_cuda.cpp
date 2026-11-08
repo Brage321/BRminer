@@ -12,7 +12,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <fstream>
 #include <limits>
 #include <iomanip>
 #include <sstream>
@@ -211,7 +213,12 @@ private:
 	DynamicLibrary compiler;
 };
 
-std::vector<char> compileKernel(CudaApi& api, int architecture) {
+struct CompiledCudaModule {
+	std::vector<char> image;
+	bool cubin{};
+};
+
+CompiledCudaModule compileKernel(CudaApi& api, int architecture) {
 	int major{}, minor{};
 	requireCuda(api.nvrtcVersion(&major, &minor), "NVRTC version query");
 	std::string kernel_source;
@@ -241,7 +248,26 @@ std::vector<char> compileKernel(CudaApi& api, int architecture) {
 	requireCuda(cubin ? api.nvrtcGetCUBINSize(program, &ptx_size) : api.nvrtcGetPTXSize(program, &ptx_size), "NVRTC output size query");
 	std::vector<char> ptx(ptx_size);
 	requireCuda(cubin ? api.nvrtcGetCUBIN(program, ptx.data()) : api.nvrtcGetPTX(program, ptx.data()), "NVRTC output read");
-	return ptx;
+	return {std::move(ptx), cubin};
+}
+
+std::vector<char> readCudaModule(const std::filesystem::path& path) {
+	std::ifstream file{path, std::ios::binary | std::ios::ate};
+	if (!file) throw std::runtime_error("Cannot open precompiled CUDA module: " + path.string());
+	const auto length{file.tellg()};
+	if (length <= 0) throw std::runtime_error("Precompiled CUDA module is empty: " + path.string());
+	std::vector<char> image(static_cast<std::size_t>(length));
+	file.seekg(0);
+	if (!file.read(image.data(), static_cast<std::streamsize>(length)))
+		throw std::runtime_error("Cannot read precompiled CUDA module: " + path.string());
+	return image;
+}
+
+void writeCudaModule(const std::filesystem::path& path, const std::vector<char>& image) {
+	if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
+	std::ofstream file{path, std::ios::binary};
+	if (!file || !file.write(image.data(), static_cast<std::streamsize>(image.size())))
+		throw std::runtime_error("Cannot write compiled CUDA module: " + path.string());
 }
 
 std::string cudaDeviceName(CudaApi& api, int device) {
@@ -269,6 +295,54 @@ CudaDeviceIdentity cudaIdentity(CudaApi& api, int device) {
 	return identity;
 }
 
+std::array<std::uint32_t, 21> cudaJob(const Header& header) {
+	std::array<std::uint32_t, 21> job{};
+	const auto midstate{warthogSha256Midstate(header)};
+	std::copy(midstate.begin(), midstate.end(), job.begin());
+	for (std::size_t i{}; i < 3; ++i) {
+		const auto p{64 + i * 4};
+		job[8 + i] = (static_cast<std::uint32_t>(header[p]) << 24) |
+			(static_cast<std::uint32_t>(header[p + 1]) << 16) |
+			(static_cast<std::uint32_t>(header[p + 2]) << 8) | header[p + 3];
+	}
+	// The first three rounds of the header tail depend only on job words.
+	// Preserve the original midstate for SHA's final feed-forward.
+	std::uint32_t a{job[0]}, b{job[1]}, c{job[2]}, d{job[3]};
+	std::uint32_t e{job[4]}, f{job[5]}, g{job[6]}, h{job[7]};
+	constexpr std::array<std::uint32_t, 3> round_constants{
+		0x428a2f98U, 0x71374491U, 0xb5c0fbcfU};
+	for (std::size_t i{}; i < round_constants.size(); ++i) {
+		const std::uint32_t sigma1{std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25)};
+		const std::uint32_t sigma0{std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22)};
+		const std::uint32_t choice{(e & f) ^ (~e & g)};
+		const std::uint32_t majority{(a & b) ^ (a & c) ^ (b & c)};
+		const std::uint32_t t1{h + sigma1 + choice + round_constants[i] + job[8 + i]};
+		const std::uint32_t t2{sigma0 + majority};
+		h = g; g = f; f = e; e = d + t1;
+		d = c; c = b; b = a; a = t1 + t2;
+	}
+	// Physical SHA registers after three argument-rotated kernel rounds.
+	job[11] = e; job[12] = f; job[13] = g;
+	job[14] = a; job[15] = b; job[16] = c;
+	const auto sigma1 = [](std::uint32_t value) {
+		return std::rotr(value, 6) ^ std::rotr(value, 11) ^ std::rotr(value, 25);
+	};
+	const auto sigma0 = [](std::uint32_t value) {
+		return std::rotr(value, 2) ^ std::rotr(value, 13) ^ std::rotr(value, 22);
+	};
+	const auto small0 = [](std::uint32_t value) {
+		return std::rotr(value, 7) ^ std::rotr(value, 18) ^ (value >> 3);
+	};
+	const auto small1 = [](std::uint32_t value) {
+		return std::rotr(value, 17) ^ std::rotr(value, 19) ^ (value >> 10);
+	};
+	job[17] = h + sigma1(e) + ((e & f) ^ (~e & g)) + 0xe9b5dba5U;
+	job[18] = sigma0(a) + ((a & b) ^ (a & c) ^ (b & c));
+	job[19] = job[8] + small0(job[9]);
+	job[20] = job[9] + small1(640U) + small0(job[10]);
+	return job;
+}
+
 }  // namespace
 
 struct CudaSha256tMiner::Impl {
@@ -286,9 +360,20 @@ struct CudaSha256tMiner::Impl {
 	Function scan_function{};
 	std::array<DevicePtr, 2> device_jobs{};
 	std::array<DevicePtr, 2> device_outputs{};
-	void* host_job{};
+	std::array<void*, 2> host_jobs{};
 	std::array<void*, 2> host_outputs{};
 	std::array<std::size_t, 2> output_capacities{};
+	struct PendingLane {
+		bool pending{};
+		std::uint64_t tag{};
+		std::uint32_t nonce_start{}, nonce_count{}, lo{}, hi{};
+		std::size_t requested{};
+		std::array<std::uint32_t, 21> job{};
+	};
+	std::array<PendingLane, 2> pending_lanes{};
+	std::deque<std::size_t> pending_order;
+	std::size_t next_lane{};
+	CudaPipelineStats pipeline_stats;
 	std::string name;
 	CudaDeviceIdentity identity;
 
@@ -296,7 +381,7 @@ struct CudaSha256tMiner::Impl {
 		if (context) api.cuCtxSetCurrent(context);
 		for (auto stream : streams) if (stream) api.cuStreamSynchronize(stream);
 		for (auto output : host_outputs) if (output) api.cuMemFreeHost(output);
-		if (host_job) api.cuMemFreeHost(host_job);
+		for (auto job : host_jobs) if (job) api.cuMemFreeHost(job);
 		for (auto output : device_outputs) if (output) api.cuMemFree(output);
 		for (auto job : device_jobs) if (job) api.cuMemFree(job);
 		if (module) api.cuModuleUnload(module);
@@ -305,6 +390,7 @@ struct CudaSha256tMiner::Impl {
 	}
 
 	void initialize(std::size_t index) {
+		const auto initialization_start{std::chrono::steady_clock::now()};
 		requireCuda(api.cuInit(0), "driver initialization");
 		int count{};
 		requireCuda(api.cuDeviceGetCount(&count), "device count query");
@@ -322,13 +408,37 @@ struct CudaSha256tMiner::Impl {
 		requireCuda(api.cuCtxCreate(&context, 4, device), "blocking context creation");
 		for (auto& stream : streams)
 			requireCuda(api.cuStreamCreate(&stream, 1), "stream creation");
-		const auto ptx{compileKernel(api, major * 10 + minor)};
-		requireCuda(api.cuModuleLoadData(&module, ptx.data()), "PTX module load");
+		std::string module_policy{environmentValue("BRMINER_EXPERIMENT_CUDA_MODULE")};
+		if (module_policy.empty()) module_policy = "nvrtc";
+		std::vector<char> module_image;
+		if (module_policy == "nvrtc") {
+			auto compiled{compileKernel(api, major * 10 + minor)};
+			identity.module_mode = compiled.cubin ? "nvrtc-cubin" : "nvrtc-ptx";
+			module_image = std::move(compiled.image);
+			if (const auto dump_path{environmentValue("BRMINER_DUMP_CUDA_MODULE")};
+				!dump_path.empty()) writeCudaModule(dump_path, module_image);
+		}
+		else if (module_policy == "cubin") {
+			const auto path{environmentValue("BRMINER_CUDA_CUBIN")};
+			if (path.empty())
+				throw std::invalid_argument(
+					"BRMINER_CUDA_CUBIN is required when BRMINER_EXPERIMENT_CUDA_MODULE=cubin.");
+			module_image = readCudaModule(path);
+			identity.module_mode = "precompiled-cubin";
+		}
+		else {
+			throw std::invalid_argument("BRMINER_EXPERIMENT_CUDA_MODULE must be nvrtc or cubin.");
+		}
+		requireCuda(api.cuModuleLoadData(&module, module_image.data()), "CUDA module load");
 		requireCuda(api.cuModuleGetFunction(&scan_function, module, "scan"),
 			"SHA256t kernel lookup");
 		for (auto& job : device_jobs)
 			requireCuda(api.cuMemAlloc(&job, 84), "job buffer allocation");
-		requireCuda(api.cuMemHostAlloc(&host_job, 84, 0), "pinned job allocation");
+		for (auto& job : host_jobs)
+			requireCuda(api.cuMemHostAlloc(&job, 84, 0), "pinned job allocation");
+		identity.initialization_nanos = static_cast<std::uint64_t>(
+			std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - initialization_start).count());
 	}
 
 	void ensureCapacity(std::size_t index, std::size_t needed) {
@@ -345,6 +455,7 @@ struct CudaSha256tMiner::Impl {
 		requireCuda(api.cuMemAlloc(&device_outputs[index], bytes), "candidate buffer allocation");
 		requireCuda(api.cuMemHostAlloc(&host_outputs[index], bytes, 0), "pinned candidate allocation");
 		output_capacities[index] = grown;
+		++pipeline_stats.buffer_growths;
 	}
 
 	std::vector<Sha256tCandidate> scan(const Header& header,
@@ -355,51 +466,7 @@ struct CudaSha256tMiner::Impl {
 			static_cast<std::uint64_t>(UINT32_MAX) + 1) {
 			throw std::invalid_argument("CUDA Warthog nonce batch is out of range.");
 		}
-		std::array<std::uint32_t, 21> job{};
-		const auto midstate{warthogSha256Midstate(header)};
-		std::copy(midstate.begin(), midstate.end(), job.begin());
-		for (std::size_t i{}; i < 3; ++i) {
-			const auto p{64 + i * 4};
-			job[8 + i] = (static_cast<std::uint32_t>(header[p]) << 24) |
-				(static_cast<std::uint32_t>(header[p + 1]) << 16) |
-				(static_cast<std::uint32_t>(header[p + 2]) << 8) | header[p + 3];
-		}
-		// The first three rounds of the header tail depend only on job words.
-		// Preserve the original midstate for SHA's final feed-forward.
-		std::uint32_t a{job[0]}, b{job[1]}, c{job[2]}, d{job[3]};
-		std::uint32_t e{job[4]}, f{job[5]}, g{job[6]}, h{job[7]};
-		constexpr std::array<std::uint32_t, 3> round_constants{
-			0x428a2f98U, 0x71374491U, 0xb5c0fbcfU};
-		for (std::size_t i{}; i < round_constants.size(); ++i) {
-			const std::uint32_t sigma1{std::rotr(e, 6) ^ std::rotr(e, 11) ^ std::rotr(e, 25)};
-			const std::uint32_t sigma0{std::rotr(a, 2) ^ std::rotr(a, 13) ^ std::rotr(a, 22)};
-			const std::uint32_t choice{(e & f) ^ (~e & g)};
-			const std::uint32_t majority{(a & b) ^ (a & c) ^ (b & c)};
-			const std::uint32_t t1{h + sigma1 + choice + round_constants[i] + job[8 + i]};
-			const std::uint32_t t2{sigma0 + majority};
-			h = g; g = f; f = e; e = d + t1;
-			d = c; c = b; b = a; a = t1 + t2;
-		}
-		// Physical SHA registers after three argument-rotated kernel rounds.
-		job[11] = e; job[12] = f; job[13] = g;
-		job[14] = a; job[15] = b; job[16] = c;
-		const auto sigma1 = [](std::uint32_t value) {
-			return std::rotr(value, 6) ^ std::rotr(value, 11) ^ std::rotr(value, 25);
-		};
-		const auto sigma0 = [](std::uint32_t value) {
-			return std::rotr(value, 2) ^ std::rotr(value, 13) ^ std::rotr(value, 22);
-		};
-		const auto small0 = [](std::uint32_t value) {
-			return std::rotr(value, 7) ^ std::rotr(value, 18) ^ (value >> 3);
-		};
-		const auto small1 = [](std::uint32_t value) {
-			return std::rotr(value, 17) ^ std::rotr(value, 19) ^ (value >> 10);
-		};
-		job[17] = h + sigma1(e) + ((e & f) ^ (~e & g)) + 0xe9b5dba5U;
-		job[18] = sigma0(a) + ((a & b) ^ (a & c) ^ (b & c));
-		job[19] = job[8] + small0(job[9]);
-		job[20] = job[9] + small1(640U) + small0(job[10]);
-		std::memcpy(host_job, job.data(), sizeof(job));
+		const auto job{cudaJob(header)};
 		if (threshold <= kShaWordFloor) return {};
 		std::uint32_t lo{kShaWordFloor};
 		std::uint32_t hi{threshold - 1};
@@ -418,7 +485,8 @@ struct CudaSha256tMiner::Impl {
 			for (std::size_t i{}; i < 2; ++i) {
 				if (!part_counts[i]) continue;
 				ensureCapacity(i, requested[i]);
-				requireCuda(api.cuMemcpyHtoDAsync(device_jobs[i], host_job, 84, streams[i]),
+				std::memcpy(host_jobs[i], job.data(), sizeof(job));
+				requireCuda(api.cuMemcpyHtoDAsync(device_jobs[i], host_jobs[i], 84, streams[i]),
 					"job upload");
 				requireCuda(api.cuMemsetD32Async(device_outputs[i], 0, 1, streams[i]),
 					"candidate counter reset");
@@ -458,6 +526,109 @@ struct CudaSha256tMiner::Impl {
 			}
 			return candidates;
 		}
+	}
+
+	void launchPipelineLane(std::size_t index) {
+		auto& lane{pending_lanes[index]};
+		ensureCapacity(index, lane.requested);
+		std::memcpy(host_jobs[index], lane.job.data(), sizeof(lane.job));
+		requireCuda(api.cuMemcpyHtoDAsync(device_jobs[index], host_jobs[index], 84,
+			streams[index]), "pipeline job upload");
+		requireCuda(api.cuMemsetD32Async(device_outputs[index], 0, 1, streams[index]),
+			"pipeline candidate counter reset");
+		DevicePtr job_arg{device_jobs[index]}, output_arg{device_outputs[index]};
+		std::uint32_t capacity_arg{static_cast<std::uint32_t>(lane.requested)};
+		auto start_arg{lane.nonce_start}, count_arg{lane.nonce_count};
+		void* arguments[]{&job_arg, &start_arg, &count_arg, &lane.lo,
+			&lane.hi, &capacity_arg, &output_arg};
+		const auto blocks{(lane.nonce_count + block_size - 1) / block_size};
+		requireCuda(api.cuLaunchKernel(scan_function, blocks, 1, 1,
+			block_size, 1, 1, 0, streams[index], arguments, nullptr),
+			"pipeline SHA256t kernel launch");
+		const auto bytes{4 + lane.requested * sizeof(Sha256tCandidate)};
+		requireCuda(api.cuMemcpyDtoHAsync(host_outputs[index], device_outputs[index],
+			bytes, streams[index]), "pipeline candidate readback");
+		lane.pending = true;
+		++pipeline_stats.kernel_launches;
+	}
+
+	CudaPipelineResult harvestPipelineLane(std::size_t index) {
+		auto& lane{pending_lanes[index]};
+		if (!lane.pending) throw std::logic_error("CUDA pipeline lane is not pending.");
+		std::uint32_t actual{};
+		for (;;) {
+			const auto wait_start{std::chrono::steady_clock::now()};
+			requireCuda(api.cuStreamSynchronize(streams[index]), "pipeline completion");
+			pipeline_stats.host_wait_nanos += static_cast<std::uint64_t>(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - wait_start).count());
+			std::memcpy(&actual, host_outputs[index], sizeof(actual));
+			if (actual <= lane.requested) break;
+			++pipeline_stats.overflow_retries;
+			lane.requested = std::min<std::size_t>(lane.nonce_count,
+				std::max<std::size_t>(actual, lane.requested * 2));
+			launchPipelineLane(index);
+		}
+		CudaPipelineResult result;
+		result.tag = lane.tag;
+		result.nonce_start = lane.nonce_start;
+		result.nonce_count = lane.nonce_count;
+		result.candidates.reserve(actual);
+		if (actual) {
+			const auto* first{reinterpret_cast<const Sha256tCandidate*>(
+				static_cast<const std::uint8_t*>(host_outputs[index]) + 4)};
+			result.candidates.insert(result.candidates.end(), first, first + actual);
+		}
+		lane = {};
+		++pipeline_stats.batches_completed;
+		return result;
+	}
+
+	std::optional<CudaPipelineResult> submitPipelined(const Header& header,
+		std::uint32_t nonce_start, std::uint32_t count, std::uint32_t threshold,
+		std::uint64_t tag) {
+		requireCuda(api.cuCtxSetCurrent(context), "pipeline context selection");
+		if (count == 0 || count > kCudaBatchLimit ||
+			static_cast<std::uint64_t>(nonce_start) + count >
+			static_cast<std::uint64_t>(UINT32_MAX) + 1) {
+			throw std::invalid_argument("CUDA Warthog pipeline nonce batch is out of range.");
+		}
+		const auto index{next_lane};
+		if (pending_lanes[index].pending)
+			throw std::logic_error("CUDA pipeline has no free submission lane.");
+		next_lane ^= 1U;
+		auto& lane{pending_lanes[index]};
+		lane.tag = tag;
+		lane.nonce_start = nonce_start;
+		lane.nonce_count = count;
+		lane.job = cudaJob(header);
+		lane.lo = kShaWordFloor;
+		lane.hi = threshold > kShaWordFloor ? threshold - 1 : kShaWordFloor;
+		const double fraction{threshold > lane.lo
+			? static_cast<double>(threshold - lane.lo) / 4294967296.0 : 0.0};
+		lane.requested = std::min<std::size_t>(count,
+			std::max<std::size_t>(4096, static_cast<std::size_t>(
+				std::ceil(static_cast<double>(count) * fraction * 1.25 + 4096.0))));
+		if (threshold > kShaWordFloor) launchPipelineLane(index);
+		else {
+			ensureCapacity(index, lane.requested);
+			std::memset(host_outputs[index], 0, sizeof(std::uint32_t));
+			lane.pending = true;
+		}
+		pending_order.push_back(index);
+		++pipeline_stats.batches_submitted;
+		if (pending_order.size() < 2) return std::nullopt;
+		const auto harvest_index{pending_order.front()};
+		pending_order.pop_front();
+		return harvestPipelineLane(harvest_index);
+	}
+
+	std::optional<CudaPipelineResult> harvestPipelined() {
+		requireCuda(api.cuCtxSetCurrent(context), "pipeline context selection");
+		if (pending_order.empty()) return std::nullopt;
+		const auto index{pending_order.front()};
+		pending_order.pop_front();
+		return harvestPipelineLane(index);
 	}
 };
 
@@ -509,6 +680,21 @@ std::vector<Sha256tCandidate> CudaSha256tMiner::scan(const Header& header,
 	std::uint32_t nonce_start, std::uint32_t nonce_count,
 	std::uint32_t candidate_threshold) {
 	return impl->scan(header, nonce_start, nonce_count, candidate_threshold);
+}
+
+std::optional<CudaPipelineResult> CudaSha256tMiner::submitPipelined(
+	const Header& header, std::uint32_t nonce_start, std::uint32_t nonce_count,
+	std::uint32_t candidate_threshold, std::uint64_t tag) {
+	return impl->submitPipelined(header, nonce_start, nonce_count,
+		candidate_threshold, tag);
+}
+
+std::optional<CudaPipelineResult> CudaSha256tMiner::harvestPipelined() {
+	return impl->harvestPipelined();
+}
+
+CudaPipelineStats CudaSha256tMiner::pipelineStats() const {
+	return impl->pipeline_stats;
 }
 
 const std::string& CudaSha256tMiner::deviceName() const { return impl->name; }
